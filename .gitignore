@@ -1,0 +1,15 @@
+/build/
+/release/
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+*.tmp
+*.image
+config.json
+status.json
+history.json
+hdc
+*.dylib
+*.pem
+*.key

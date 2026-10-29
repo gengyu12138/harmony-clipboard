@@ -1,0 +1,341 @@
+#!/usr/bin/python3
+"""Mac ↔ HarmonyOS text clipboard bridge using the official hdc/testhelper."""
+import argparse
+import base64
+import ctypes as C
+import fcntl
+import ipaddress
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = Path.home() / 'Library/Application Support/HarmonyClipboard'
+LABEL = 'local.gengyu.harmony-clipboard'
+PLIST = Path.home() / 'Library/LaunchAgents' / (LABEL + '.plist')
+SERVICE = 'gui/' + str(os.getuid()) + '/' + LABEL
+SERVER = '127.0.0.1:18710'
+MAX_BYTES = 16 * 1024  # Base64 remains below the hdc command packet limit.
+STOP = threading.Event()
+
+
+class Pasteboard:
+    """Small native bridge: changeCount avoids polling pbpaste subprocesses."""
+    def __init__(self):
+        C.CDLL('/System/Library/Frameworks/AppKit.framework/AppKit')
+        lib = C.CDLL('/usr/lib/libobjc.A.dylib')
+        lib.objc_getClass.argtypes = [C.c_char_p]
+        lib.objc_getClass.restype = C.c_void_p
+        lib.sel_registerName.argtypes = [C.c_char_p]
+        lib.sel_registerName.restype = C.c_void_p
+        self.lib = lib
+        self.selectors = {}
+        self.functions = {}
+        self.cls = lib.objc_getClass
+        self.board = self.call(C.c_void_p, self.cls(b'NSPasteboard'), 'generalPasteboard')
+
+    def call(self, result, obj, name, args=(), types=()):
+        if name not in self.selectors:
+            self.selectors[name] = self.lib.sel_registerName(name.encode())
+        key = (result, types)
+        if key not in self.functions:
+            self.functions[key] = C.CFUNCTYPE(result, C.c_void_p, C.c_void_p, *types)(
+                ('objc_msgSend', self.lib))
+        return self.functions[key](obj, self.selectors[name], *args)
+
+    def string(self, text):
+        return self.call(C.c_void_p, self.cls(b'NSString'), 'stringWithUTF8String:',
+                         (text.encode('utf-8'),), (C.c_char_p,))
+
+    def count(self):
+        return self.call(C.c_long, self.board, 'changeCount')
+
+    def read(self):
+        pool = self.call(C.c_void_p, self.cls(b'NSAutoreleasePool'), 'new')
+        try:
+            count = self.count()
+            kinds = self.call(C.c_void_p, self.board, 'types')
+            for marker in ('org.nspasteboard.ConcealedType', 'org.nspasteboard.TransientType',
+                           'com.agilebits.onepassword'):
+                if kinds and self.call(C.c_bool, kinds, 'containsObject:',
+                                       (self.string(marker),), (C.c_void_p,)):
+                    return count, None
+            value = self.call(C.c_void_p, self.board, 'stringForType:',
+                              (self.string('public.utf8-plain-text'),), (C.c_void_p,))
+            text = None
+            if value:
+                size = self.call(C.c_ulong, value, 'lengthOfBytesUsingEncoding:',
+                                 (4,), (C.c_ulong,))
+                ptr = self.call(C.c_void_p, value, 'UTF8String')
+                text = C.string_at(ptr, size).decode('utf-8')
+            if count != self.count():
+                raise RuntimeError('mac_clipboard_changed_during_read')
+            return count, text
+        finally:
+            self.call(None, pool, 'drain')
+
+    def write(self, text, expected_count):
+        pool = self.call(C.c_void_p, self.cls(b'NSAutoreleasePool'), 'new')
+        try:
+            value = self.string(text)
+            kind = self.string('public.utf8-plain-text')
+            if self.count() != expected_count:
+                return None
+            self.call(C.c_long, self.board, 'clearContents')
+            ok = self.call(C.c_bool, self.board, 'setString:forType:',
+                           (value, kind), (C.c_void_p, C.c_void_p))
+            if not ok:
+                raise RuntimeError('mac_clipboard_write_failed')
+            return self.count()
+        finally:
+            self.call(None, pool, 'drain')
+
+
+def eligible(text):
+    return text is not None and text != '' and '\0' not in text and len(text.encode('utf-8')) <= MAX_BYTES
+
+
+def atomic_json(path, data):
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    temp.replace(path)
+
+
+class Bridge:
+    def __init__(self):
+        self.config = json.loads((ROOT / 'config.json').read_text())
+        validate_endpoint(self.config['endpoint'])
+        self.endpoint = self.config['endpoint']
+        self.env = dict(os.environ, OHOS_HDC_CMD_RECORD='0', OHOS_HDC_LOG_LEVEL='0',
+                        OHOS_HDC_ENCRYPT_CHANNEL='1')
+        self.server = None
+        self.board = Pasteboard()
+        self.mac_count, _ = self.board.read()
+        self.phone_text = None
+        self.pending = None
+        self.connected = False
+        self.retry_at = 0.0
+        self.backoff = 2.0
+        self.state = {}
+        self.saved_state = None
+        self.saved_at = 0.0
+
+    def status(self, **changes):
+        self.state.update(changes)
+        self.state.update(pid=os.getpid(), endpoint=self.endpoint,
+                          connected=self.connected, pending_mac=self.pending is not None)
+        if self.state != self.saved_state or time.monotonic() - self.saved_at > 30:
+            atomic_json(ROOT / 'status.json', dict(self.state, updated_at=time.strftime('%Y-%m-%d %H:%M:%S')))
+            self.saved_state = dict(self.state)
+            self.saved_at = time.monotonic()
+
+    def command(self, *args, timeout=4):
+        cmd = [str(ROOT / 'bin/hdc'), '-p', '-s', SERVER, '-l0', *args]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=timeout, env=self.env)
+        if result.returncode:
+            raise RuntimeError('hdc_command_failed')
+        return result.stdout
+
+    def remote(self, command):
+        return self.command('-t', self.endpoint, 'shell', command)
+
+    def start_server(self):
+        if self.server is not None and self.server.poll() is None:
+            return
+        with socket.socket() as probe:
+            if probe.connect_ex(('127.0.0.1', 18710)) == 0:
+                raise RuntimeError('private_hdc_port_busy')
+        self.server = subprocess.Popen([str(ROOT / 'bin/hdc'), '-s', SERVER, '-l0', '-m'],
+                                       env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        STOP.wait(0.5)
+        if self.server.poll() is not None:
+            raise RuntimeError('hdc_server_start_failed_or_another_hdc_is_running')
+
+    def connect(self):
+        self.start_server()
+        targets = self.command('list', 'targets', '-v').decode('utf-8')
+        ready = any(row.split()[:3] == [self.endpoint, 'TCP', 'Connected']
+                    for row in targets.splitlines())
+        if not ready:
+            # hdc may retain an Unknown session after a timed-out handshake.
+            if any(row.split()[:1] == [self.endpoint] for row in targets.splitlines()):
+                self.command('tconn', self.endpoint, '-remove')
+            reply = self.command('tconn', self.endpoint, timeout=6)
+            if b'Connect OK' not in reply:
+                raise RuntimeError('connection_unavailable')
+        self.connected = True
+        self.backoff = 2.0
+        logging.info('connected')
+        self.status(state='connected', error=None)
+
+    def capture_mac(self):
+        count, text = self.board.read()
+        if count != self.mac_count:
+            self.mac_count = count
+            self.pending = text if eligible(text) else None
+            self.status(mac_text_skipped=not eligible(text))
+        return count
+
+    def sync(self):
+        self.capture_mac()
+        if self.pending is not None:
+            text = self.pending
+            # Fixed shell code + base64 avoids quote expansion and code execution.
+            # The final dot prevents command substitution stripping trailing newlines.
+            encoded = base64.b64encode(text.encode('utf-8')).decode('ascii')
+            command = ('task_clip_text=$(printf %s ' + encoded + ' | base64 -d; printf .); '
+                       'testhelper set-pastedata "${task_clip_text%.}"')
+            reply = self.remote(command)
+            if reply != b'Pasteboard text set successfully.\n':
+                raise RuntimeError('phone_clipboard_write_failed')
+            self.phone_text = text
+            self.pending = None
+            self.status(last_direction='Mac → 手机', last_sync=time.strftime('%Y-%m-%d %H:%M:%S'))
+        count = self.capture_mac()
+        if self.pending is not None:
+            return
+        reply = self.remote('testhelper get-pastedata')
+        if reply == b'Error: Service is not available.\n':
+            # Locked phones can still accept writes; do not disconnect on read denial.
+            self.status(state='phone_read_unavailable', error='手机可能锁屏，Mac → 手机仍可同步')
+            return
+        prefix = b'Pasteboard text: '
+        if not reply.startswith(prefix) or not reply.endswith(b'\n'):
+            raise RuntimeError('phone_clipboard_read_failed')
+        text = reply[len(prefix):-1].decode('utf-8')
+        if self.board.count() != count:
+            return  # A Mac copy during the network call takes priority next cycle.
+        previous = self.phone_text
+        if previous is not None and text != previous and eligible(text):
+            written_count = self.board.write(text, count)
+            if written_count is None:
+                return
+            self.mac_count = written_count
+            self.status(last_direction='手机 → Mac', last_sync=time.strftime('%Y-%m-%d %H:%M:%S'))
+        self.phone_text = text
+        self.status(state='syncing', error=None)
+
+    def close(self):
+        if self.server is not None and self.server.poll() is None:
+            self.server.terminate()
+            try:
+                self.server.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+                self.server.wait()
+        self.connected = False
+        self.pending = None
+        self.status(state='stopped', error=None)
+
+    def run(self):
+        self.status(state='starting')
+        try:
+            while not STOP.is_set():
+                started = time.monotonic()
+                try:
+                    config = json.loads((ROOT / 'config.json').read_text())
+                    endpoint = validate_endpoint(config['endpoint'])
+                    if endpoint != self.endpoint:
+                        # A changed target must not receive pending text intended for the old phone.
+                        self.close()
+                        self.endpoint = endpoint
+                        self.phone_text = None
+                        self.retry_at = 0.0
+                        self.backoff = 2.0
+                        self.mac_count = self.board.count()
+                    self.capture_mac()
+                    if not self.connected and started >= self.retry_at:
+                        self.connect()
+                    if self.connected and not STOP.is_set():
+                        self.sync()
+                except (OSError, RuntimeError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+                    # Never log exception messages: command arguments can contain clipboard text.
+                    if self.connected:
+                        logging.warning('connection_or_clipboard_unavailable')
+                    self.connected = False
+                    self.retry_at = time.monotonic() + self.backoff
+                    self.backoff = min(self.backoff * 2, 30)
+                    reason = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+                    self.status(state='retrying', error=reason)
+                STOP.wait(max(0.1, 0.8 - (time.monotonic() - started)))
+        finally:
+            self.close()
+
+
+def validate_endpoint(value):
+    address, port = value.rsplit(':', 1)
+    if ipaddress.ip_address(address).version != 4 or not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError('请输入手机无线调试页的 IPv4:端口')
+    return value
+
+
+def launch(*args, check=True):
+    return subprocess.run(['/bin/launchctl', *args], check=check,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+
+
+def control(action, quiet=False):
+    loaded = launch('print', SERVICE, check=False).returncode == 0
+    if action == 'stop':
+        launch('disable', SERVICE)
+        if loaded:
+            launch('bootout', SERVICE)
+            deadline = time.monotonic() + 15
+            while launch('print', SERVICE, check=False).returncode == 0:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('service_stop_timeout')
+                time.sleep(0.2)
+        if not quiet:
+            print('已暂停同步，并关闭登录自启。运行 start 恢复。')
+    elif action == 'start':
+        launch('enable', SERVICE)
+        if not loaded:
+            launch('bootstrap', 'gui/' + str(os.getuid()), str(PLIST))
+        if not quiet:
+            print('已启用同步和登录自启。')
+    elif action == 'status':
+        print('登录服务：' + ('已加载' if loaded else '未加载 / 已暂停'))
+        if (ROOT / 'status.json').exists():
+            print((ROOT / 'status.json').read_text())
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['run', 'start', 'stop', 'status', 'endpoint'])
+    parser.add_argument('address', nargs='?')
+    args = parser.parse_args()
+    os.umask(0o077)
+    if args.action == 'endpoint':
+        address = validate_endpoint(args.address or '')
+        config = json.loads((ROOT / 'config.json').read_text())
+        config['endpoint'] = address
+        atomic_json(ROOT / 'config.json', config)
+        print('已更新手机地址：' + address)
+    elif args.action != 'run':
+        control(args.action)
+    else:
+        with (ROOT / 'sync.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handler = RotatingFileHandler(ROOT / 'events.log', maxBytes=200000, backupCount=1)
+            logging.basicConfig(level=logging.INFO, handlers=[handler],
+                                format='%(asctime)s %(levelname)s %(message)s')
+            signal.signal(signal.SIGTERM, lambda *_: STOP.set())
+            signal.signal(signal.SIGINT, lambda *_: STOP.set())
+            Bridge().run()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        # Avoid tracebacks containing clipboard values or command arguments.
+        print('操作失败：' + type(error).__name__, file=sys.stderr)
+        sys.exit(1)

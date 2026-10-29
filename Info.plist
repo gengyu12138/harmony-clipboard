@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>local.gengyu.harmony-panel</string>
+<key>CFBundleName</key><string>接力剪贴板</string>
+<key>CFBundleDisplayName</key><string>接力剪贴板</string>
+<key>CFBundleExecutable</key><string>HarmonyPanel</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>1.1.0</string>
+<key>CFBundleVersion</key><string>2</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSUIElement</key><true/>
+<key>NSHighResolutionCapable</key><true/>
+<key>NSPasteboardUsageDescription</key><string>在本机保存你复制的文字和图片，供快捷选择与手机同步。</string>
+</dict></plist>
