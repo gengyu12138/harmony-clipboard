@@ -8,6 +8,7 @@ __pycache__/
 *.image
 config.json
 status.json
+privacy.json
 history.json
 hdc
 *.dylib

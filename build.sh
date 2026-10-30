@@ -5,7 +5,7 @@ APP="$PWD/build/接力剪贴板.app"
 /bin/rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 /usr/bin/swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 \
-  -framework AppKit -framework SwiftUI -framework Carbon -framework CryptoKit -framework ApplicationServices \
+  -framework AppKit -framework SwiftUI -framework Carbon -framework CryptoKit -framework ApplicationServices -framework ImageIO \
   Sources/*.swift -o "$APP/Contents/MacOS/HarmonyPanel"
 /bin/cp Info.plist "$APP/Contents/Info.plist"
 /bin/cp phone.py "$APP/Contents/Resources/phone.py"

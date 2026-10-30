@@ -10,10 +10,13 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from sync import ROOT, SERVER, Pasteboard, validate_endpoint
+from sync import ROOT, SERVER, Pasteboard, validate_endpoint, privacy_status
 
 
 def capture():
+    active, privacy_stamp = privacy_status()
+    if active:
+        raise RuntimeError('隐私暂停中，无法获取手机截图。')
     endpoint = validate_endpoint(json.loads((ROOT / 'config.json').read_text())['endpoint'])
     env = dict(os.environ, OHOS_HDC_CMD_RECORD='0', OHOS_HDC_LOG_LEVEL='0',
                OHOS_HDC_ENCRYPT_CHANNEL='1')
@@ -51,6 +54,8 @@ def capture():
                     raise RuntimeError('收到的截图无法解码，剪贴板未修改。')
                 board.call(None, image, 'release')
                 # A newer user copy takes priority over an in-flight capture.
+                if privacy_status() != (False, privacy_stamp):
+                    raise RuntimeError('隐私状态已变化，截图未写入剪贴板。')
                 if board.count() != expected_count:
                     raise RuntimeError('截图期间剪贴板发生变化，已保留新复制的内容；请重试。')
                 kind = board.string('public.jpeg')

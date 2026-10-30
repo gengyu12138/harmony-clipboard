@@ -9,6 +9,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -108,6 +109,22 @@ def atomic_json(path, data):
     temp.replace(path)
 
 
+def privacy_status():
+    path = ROOT / 'privacy.json'
+    try:
+        if not path.exists():
+            return False, None
+        value = json.loads(path.read_text())
+        if not isinstance(value, dict) or not isinstance(value.get('paused'), bool):
+            return True, 'invalid'
+        until = value.get('until')
+        active = value['paused'] and (until is None or float(until) > time.time())
+        return bool(active), value.get('generation')
+    except (OSError, ValueError, TypeError, KeyError):
+        # A damaged privacy file must never silently resume data transfer.
+        return True, 'invalid'
+
+
 class Bridge:
     def __init__(self):
         self.config = json.loads((ROOT / 'config.json').read_text())
@@ -124,8 +141,14 @@ class Bridge:
         self.retry_at = 0.0
         self.backoff = 2.0
         self.state = {}
+        try:
+            previous = json.loads((ROOT / 'status.json').read_text())
+            self.state = {key: previous[key] for key in ('last_sync', 'last_direction') if isinstance(previous.get(key), str)}
+        except (OSError, ValueError, AttributeError):
+            pass  # Status is a disposable cache; never prevent sync because an old status is unreadable.
         self.saved_state = None
         self.saved_at = 0.0
+        self.was_paused, self.privacy_stamp = privacy_status()
 
     def status(self, **changes):
         self.state.update(changes)
@@ -184,7 +207,13 @@ class Bridge:
             self.status(mac_text_skipped=not eligible(text))
         return count
 
+    def sync_allowed(self):
+        active, stamp = privacy_status()
+        return not active and stamp == self.privacy_stamp
+
     def sync(self):
+        if not self.sync_allowed():
+            return
         self.capture_mac()
         if self.pending is not None:
             text = self.pending
@@ -193,6 +222,8 @@ class Bridge:
             encoded = base64.b64encode(text.encode('utf-8')).decode('ascii')
             command = ('task_clip_text=$(printf %s ' + encoded + ' | base64 -d; printf .); '
                        'testhelper set-pastedata "${task_clip_text%.}"')
+            if not self.sync_allowed():
+                return
             reply = self.remote(command)
             if reply != b'Pasteboard text set successfully.\n':
                 raise RuntimeError('phone_clipboard_write_failed')
@@ -211,6 +242,8 @@ class Bridge:
         if not reply.startswith(prefix) or not reply.endswith(b'\n'):
             raise RuntimeError('phone_clipboard_read_failed')
         text = reply[len(prefix):-1].decode('utf-8')
+        if not self.sync_allowed():
+            return
         if self.board.count() != count:
             return  # A Mac copy during the network call takes priority next cycle.
         previous = self.phone_text
@@ -241,6 +274,16 @@ class Bridge:
             while not STOP.is_set():
                 started = time.monotonic()
                 try:
+                    active, stamp = privacy_status()
+                    if active or self.was_paused or stamp != self.privacy_stamp:
+                        self.pending = None
+                        self.phone_text = None
+                        self.mac_count = self.board.count()
+                        self.was_paused, self.privacy_stamp = active, stamp
+                    if active:
+                        self.status(state='privacy_paused', error=None)
+                        STOP.wait(0.8)
+                        continue
                     config = json.loads((ROOT / 'config.json').read_text())
                     endpoint = validate_endpoint(config['endpoint'])
                     if endpoint != self.endpoint:
@@ -282,10 +325,15 @@ def launch(*args, check=True):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
 
 
+def service_disabled(label, output):
+    return re.search(r'"' + re.escape(label) + r'"\s*=>\s*(?:true|disabled)\b', output) is not None
+
+
 def control(action, quiet=False):
     loaded = launch('print', SERVICE, check=False).returncode == 0
-    if action == 'stop':
-        launch('disable', SERVICE)
+    if action in ('stop', 'runtime-stop'):
+        if action == 'stop':
+            launch('disable', SERVICE)
         if loaded:
             launch('bootout', SERVICE)
             deadline = time.monotonic() + 15
@@ -295,10 +343,18 @@ def control(action, quiet=False):
                 time.sleep(0.2)
         if not quiet:
             print('已暂停同步，并关闭登录自启。运行 start 恢复。')
-    elif action == 'start':
+    elif action in ('start', 'runtime-start'):
+        disabled = launch('print-disabled', 'gui/' + str(os.getuid())).stdout.decode('utf-8')
+        restore_disabled = action == 'runtime-start' and service_disabled(LABEL, disabled)
         launch('enable', SERVICE)
         if not loaded:
-            launch('bootstrap', 'gui/' + str(os.getuid()), str(PLIST))
+            try:
+                launch('bootstrap', 'gui/' + str(os.getuid()), str(PLIST))
+            finally:
+                if restore_disabled:
+                    launch('disable', SERVICE)
+        elif restore_disabled:
+            launch('disable', SERVICE)
         if not quiet:
             print('已启用同步和登录自启。')
     elif action == 'status':

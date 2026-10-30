@@ -9,11 +9,34 @@ import sys
 
 ROOT = Path.home() / 'Library/Application Support/HarmonyClipboard'
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'Bridge'))
-from sync import SERVER, MAX_BYTES, validate_endpoint, atomic_json, control
+from sync import SERVER, MAX_BYTES, validate_endpoint, atomic_json, control, launch, privacy_status, service_disabled
+
+
+def service_preferences():
+    disabled = launch('print-disabled', 'gui/' + str(os.getuid())).stdout.decode('utf-8')
+    return {key: not service_disabled(label, disabled) for key, label in (
+        ('panel_autostart', 'local.gengyu.harmony-panel'),
+        ('sync_autostart', 'local.gengyu.harmony-clipboard'))}
 
 
 def main():
     action = sys.argv[1]
+    if action == 'services':
+        return service_preferences()
+    if action == 'autostart':
+        value = json.loads(sys.stdin.buffer.read(1024))
+        labels = {'panel_autostart': 'local.gengyu.harmony-panel', 'sync_autostart': 'local.gengyu.harmony-clipboard'}
+        if not isinstance(value, dict) or not value or any(key not in labels or not isinstance(enabled, bool) for key, enabled in value.items()):
+            raise RuntimeError('启动设置无效。')
+        for key, enabled in value.items():
+            label = labels[key]
+            if not (Path.home() / 'Library/LaunchAgents' / (label + '.plist')).is_file():
+                raise RuntimeError('登录组件尚未安装，请先运行安装程序。')
+            launch('enable' if enabled else 'disable', 'gui/' + str(os.getuid()) + '/' + label)
+        return dict(service_preferences(), message='登录自启设置已保存；当前运行状态不变')
+    if action in ('get', 'send', 'capture', 'reconnect') and privacy_status()[0]:
+        raise RuntimeError('隐私暂停中，请先恢复记录与同步。')
+    privacy_stamp = privacy_status()[1]
     if not (ROOT / 'sync.py').is_file() or not (ROOT / 'bin/hdc').is_file():
         raise RuntimeError('手机组件未安装。请按 README 运行 install.command 并指定官方 hdc 路径；本机剪贴板仍可使用。')
     if action == 'configure':
@@ -26,24 +49,30 @@ def main():
         config = json.loads(path.read_text()) if path.exists() else {}
         config['endpoint'] = address
         atomic_json(path, config)
-        control('start', quiet=True)
+        control('runtime-start', quiet=True)
         return {'message': '地址已保存，正在连接；如手机出现调试授权提示，请允许。'}
-    if action in ('start', 'stop'):
-        if action == 'start' and not (ROOT / 'config.json').exists():
+    if action in ('start', 'stop', 'reconnect'):
+        if action in ('start', 'reconnect') and not (ROOT / 'config.json').exists():
             raise RuntimeError('请先在“手机连接设置”中填写 IP 和端口。')
-        control(action, quiet=True)
-        return {'message': '手机同步已启用' if action == 'start' else '手机同步及其登录自启已暂停；本机历史仍会记录'}
+        if action == 'reconnect':
+            control('runtime-stop', quiet=True)
+        control('runtime-stop' if action == 'stop' else 'runtime-start', quiet=True)
+        return dict(service_preferences(), message='手机同步已停止；登录设置不变' if action == 'stop' else '手机同步已启动，正在连接')
     if not (ROOT / 'config.json').exists():
         raise RuntimeError('请先在“手机连接设置”中填写 IP 和端口。')
     endpoint = validate_endpoint(json.loads((ROOT / 'config.json').read_text())['endpoint'])
     env = dict(os.environ, OHOS_HDC_CMD_RECORD='0', OHOS_HDC_LOG_LEVEL='0', OHOS_HDC_ENCRYPT_CHANNEL='1')
 
     def remote(command):
+        if privacy_status() != (False, privacy_stamp):
+            raise RuntimeError('隐私状态已变化，本次手机操作已取消。')
         result = subprocess.run([str(ROOT / 'bin/hdc'), '-p', '-s', SERVER, '-l0',
                                  '-t', endpoint, 'shell', command], env=env,
                                 capture_output=True, timeout=12)
         if result.returncode:
             raise RuntimeError('手机连接不可用，请检查 Wi-Fi 和无线调试。')
+        if privacy_status() != (False, privacy_stamp):
+            raise RuntimeError('隐私状态已变化，已丢弃本次返回内容。')
         return result.stdout
 
     if action == 'get':

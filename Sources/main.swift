@@ -3,6 +3,7 @@ import SwiftUI
 import Carbon
 import CryptoKit
 import ApplicationServices
+import ImageIO
 
 struct Clip: Codable, Identifiable {
     var id: String
@@ -18,7 +19,7 @@ struct Clip: Codable, Identifiable {
     var isImage: Bool { file != nil }
     var recordedDevices: [String] { devices ?? (["鸿蒙手机", "手机截图"].contains(source) ? ["手机"] : ["Mac"]) }
     var deviceLabel: String { recordedDevices.joined(separator: " · ") }
-    var title: String { text?.replacingOccurrences(of: "\n", with: " ") ?? "图片 · \(source)" }
+    var title: String { text.map { String($0.prefix(180)).replacingOccurrences(of: "\n", with: " ") } ?? "图片 · \(source)" }
 }
 
 final class ClipboardStore: ObservableObject {
@@ -29,6 +30,25 @@ final class ClipboardStore: ObservableObject {
     @Published var deviceFilter = "全部设备"
     @Published var pinned = false
     @Published var paused = false
+    @Published var privacyPaused = false
+    @Published var privacyLabel = ""
+    @Published var preferences = PanelPreferences.load()
+    @Published var panelAutostart: Bool?
+    @Published var syncAutostart: Bool?
+    @Published var lastSync = "尚无同步记录"
+    @Published var connectionDetail = ""
+    @Published var settingsPresented = false
+    @Published var imageRevision = 0
+    var changeHotkey: ((PanelPreferences) -> Bool)?
+    private var privacyGeneration = UUID()
+    private var skipPhoneBaseline = false
+    private let io = DispatchQueue(label: "clipboard.history.io", qos: .utility)
+    private let processing = DispatchQueue(label: "clipboard.images", qos: .userInitiated)
+    private var saveWork: DispatchWorkItem?
+    private var saveVersion = 0
+    private var pendingImages: [String: Data] = [:]
+    private var pendingDeletes: Set<String> = []
+    private var loadingImages: Set<String> = []
     @Published var busy = false
     @Published var message = "复制后自动记录 · 仅保存在本机"
     @Published var online = false
@@ -49,7 +69,7 @@ final class ClipboardStore: ObservableObject {
         clips.filter {
             (filter == "全部" || filter == "文字" && !$0.isImage || filter == "图片" && $0.isImage || filter == "收藏" && $0.favorite)
             && (deviceFilter == "全部设备" || $0.recordedDevices.contains(deviceFilter))
-            && (query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) || $0.source.localizedCaseInsensitiveContains(query))
+            && (query.isEmpty || ($0.text ?? $0.title).localizedCaseInsensitiveContains(query) || $0.source.localizedCaseInsensitiveContains(query))
         }.sorted {
             if let left = $0.pinnedAt, let right = $1.pinnedAt { return left > right }
             if ($0.pinnedAt != nil) != ($1.pinnedAt != nil) { return $0.pinnedAt != nil }
@@ -66,15 +86,21 @@ final class ClipboardStore: ObservableObject {
                 clips = try JSONDecoder().decode([Clip].self, from: Data(contentsOf: history))
             }
         } catch { historyWritable = false; message = "历史记录读取失败；本次仍可使用，原文件保留。" }
-        captureClipboard(source: "Mac 剪贴板")
+        // Never import a clipboard left behind during a previous privacy pause on relaunch.
+        lastCount = NSPasteboard.general.changeCount
+        skipPhoneBaseline = true
+        updatePrivacy()
         refreshConnection()
         timer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
             guard let self else { return }
-            if !self.paused { self.captureClipboard() }
+            self.updatePrivacy()
+            if !self.paused && !self.privacyPaused { self.captureClipboard() }
+            else { self.lastCount = NSPasteboard.general.changeCount }
+            if self.tick % 75 == 0 { self.trimHistory() }
             self.tick += 1
             if self.tick % 5 == 0 {
                 self.refreshConnection()
-                if self.online && !self.paused && !self.busy && !self.phoneReading {
+                if self.online && !self.paused && !self.privacyPaused && !self.busy && !self.phoneReading {
                     self.phone("get", automatic: true)
                 }
             }
@@ -85,76 +111,199 @@ final class ClipboardStore: ObservableObject {
     @discardableResult
     func persist(_ items: [Clip]? = nil) -> Bool {
         guard historyWritable else { message = "历史文件不可写，未保存更改"; return false }
-        do {
-            try JSONEncoder().encode(items ?? clips).write(to: root.appendingPathComponent("history.json"), options: .atomic)
-            return true
-        } catch { message = "历史记录保存失败，当前内容仍在内存中。"; return false }
+        saveVersion += 1
+        let version = saveVersion, snapshot = items ?? clips, images = pendingImages
+        let liveFiles = Set(snapshot.compactMap(\.file))
+        let deletions = pendingDeletes.subtracting(liveFiles)
+        let root = self.root
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            do {
+                for (file, data) in images where liveFiles.contains(file) {
+                    try data.write(to: root.appendingPathComponent(file), options: .atomic)
+                }
+                try JSONEncoder().encode(snapshot).write(to: root.appendingPathComponent("history.json"), options: .atomic)
+                for file in deletions where FileManager.default.fileExists(atPath: root.appendingPathComponent(file).path) {
+                    try FileManager.default.removeItem(at: root.appendingPathComponent(file))
+                }
+                DispatchQueue.main.async {
+                    guard let self, self.saveVersion == version else { return }
+                    self.pendingImages.removeAll(); self.pendingDeletes.removeAll()
+                }
+            } catch {
+                DispatchQueue.main.async { self?.message = "历史保存或清理失败，当前记录仍在内存中：\(error.localizedDescription)" }
+            }
+        }
+        saveWork = work
+        io.asyncAfter(deadline: .now() + 0.3, execute: work)
+        return true
     }
 
-    func insert(text: String? = nil, image: Data? = nil, mime: String? = nil, source: String) {
+    func flushHistory() {
+        saveWork?.cancel()
+        // A normal quit drains the last snapshot; ordinary interaction never waits for disk IO.
+        if historyWritable {
+            let snapshot = clips, images = pendingImages, deleted = pendingDeletes
+            io.sync {
+                do {
+                    let live = Set(snapshot.compactMap(\.file))
+                    for (file, data) in images where live.contains(file) {
+                        try data.write(to: root.appendingPathComponent(file), options: .atomic)
+                    }
+                    try JSONEncoder().encode(snapshot).write(to: root.appendingPathComponent("history.json"), options: .atomic)
+                    for file in deleted.subtracting(live) where FileManager.default.fileExists(atPath: root.appendingPathComponent(file).path) {
+                        try FileManager.default.removeItem(at: root.appendingPathComponent(file))
+                    }
+                } catch { NSLog("Clipboard history could not be flushed: %@", error.localizedDescription) }
+            }
+        }
+    }
+
+    func removalCandidates(using rule: PanelPreferences) -> [Clip] {
+        var remaining = clips
+        var removed: [Clip] = []
+        if rule.days > 0 {
+            let cutoff = Date().addingTimeInterval(-Double(rule.days) * 86400)
+            removed = remaining.filter { $0.pinnedAt == nil && $0.date < cutoff }
+            let ids = Set(removed.map(\.id)); remaining.removeAll { ids.contains($0.id) }
+        }
+        let candidates = remaining.filter { $0.pinnedAt == nil }.sorted {
+            if $0.favorite != $1.favorite { return !$0.favorite }
+            return $0.date < $1.date
+        }
+        var count = remaining.count, bytes = remaining.reduce(0) { $0 + $1.bytes }
+        for clip in candidates {
+            if count <= rule.count && bytes <= rule.megabytes * 1024 * 1024 { break }
+            removed.append(clip); count -= 1; bytes -= clip.bytes
+        }
+        return removed
+    }
+
+    func trimHistory() {
+        let removed = removalCandidates(using: preferences)
+        if !removed.isEmpty { deleteMany(Set(removed.map(\.id))) }
+    }
+
+    func deleteMany(_ ids: Set<String>) {
+        guard historyWritable else { message = "历史文件不可写，未执行清理"; return }
+        let removed = clips.filter { ids.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        for clip in removed {
+            if let file = clip.file { pendingDeletes.insert(file) }
+            imageCache.removeObject(forKey: clip.id as NSString)
+        }
+        clips.removeAll { ids.contains($0.id) }
+        if let selected, ids.contains(selected) { self.selected = visible.first?.id }
+        persist()
+        message = "已移除 \(removed.count) 条本机历史，正在保存"
+    }
+
+    func insert(text: String? = nil, image: Data? = nil, mime: String? = nil, source: String, capturedAt: Date = Date(), preparedID: String? = nil) {
         let data = image ?? Data((text ?? "").utf8)
         guard !data.isEmpty else { return }
         guard data.count <= 20 * 1024 * 1024 else { message = "内容超过 20 MB，未加入历史"; return }
-        let id = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let id = preparedID ?? SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let device = ["鸿蒙手机", "手机截图"].contains(source) ? "手机" : "Mac"
         if let index = clips.firstIndex(where: { $0.id == id }) {
             var item = clips.remove(at: index)
             var devices = item.recordedDevices
             if !devices.contains(device) { devices.append(device) }
             item.devices = devices
-            item.date = Date(); item.source = source
+            item.date = max(item.date, capturedAt); item.source = source
             clips.insert(item, at: 0)
         } else {
             let file = image == nil ? nil : id + ".image"
             if let file, let image {
-                do { try image.write(to: root.appendingPathComponent(file), options: .atomic) }
-                catch { message = "图片保存失败，未加入历史"; return }
+                pendingImages[file] = image; pendingDeletes.remove(file)
             }
-            clips.insert(Clip(id: id, text: text, file: file, mime: mime, source: source, date: Date(), bytes: data.count, devices: [device]), at: 0)
+            clips.insert(Clip(id: id, text: text, file: file, mime: mime, source: source, date: capturedAt, bytes: data.count, devices: [device]), at: 0)
         }
-        // Pinned records survive automatic cleanup; ordinary records go before favorites.
-        while clips.count > 100 || clips.reduce(0, { $0 + $1.bytes }) > 100 * 1024 * 1024 {
-            guard let index = clips.lastIndex(where: { $0.pinnedAt == nil && !$0.favorite }) ?? clips.lastIndex(where: { $0.pinnedAt == nil }) else { break }
-            let old = clips.remove(at: index)
-            if old.id == id { message = "历史空间已满，请取消部分置顶或删除记录" }
-            if let file = old.file { try? FileManager.default.removeItem(at: root.appendingPathComponent(file)) }
-            imageCache.removeObject(forKey: old.id as NSString)
-        }
+        trimHistory()
         if selected == nil { selected = clips.first?.id }
         persist()
     }
 
     func captureClipboard(source: String? = nil, force: Bool = false) {
+        guard !privacyPaused else { return }
         let pb = NSPasteboard.general
         guard force || pb.changeCount != lastCount else { return }
         lastCount = pb.changeCount
         let types = pb.types ?? []
         if types.contains(where: { ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"].contains($0.rawValue) }) { return }
         let origin = source ?? NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac"
-        for kind in [NSPasteboard.PasteboardType.png, NSPasteboard.PasteboardType("public.jpeg")] {
-            if types.contains(kind), let data = pb.data(forType: kind), NSImage(data: data) != nil {
-                insert(image: data, mime: kind.rawValue, source: origin); return
+        let token = privacyGeneration, date = Date()
+        for kind in [NSPasteboard.PasteboardType.png, NSPasteboard.PasteboardType("public.jpeg"), .tiff] {
+            if types.contains(kind), let data = pb.data(forType: kind) {
+                guard data.count <= 20 * 1024 * 1024 else { message = "图片超过 20 MB，未加入历史"; return }
+                processing.async { [weak self] in
+                    var converted = data, mime = kind.rawValue
+                    if kind == .tiff {
+                        guard let rep = NSBitmapImageRep(data: data), let png = rep.representation(using: .png, properties: [:]) else { return }
+                        converted = png; mime = NSPasteboard.PasteboardType.png.rawValue
+                    }
+                    guard let thumbnail = Self.thumbnail(converted) else { return }
+                    let id = SHA256.hash(data: converted).map { String(format: "%02x", $0) }.joined()
+                    let result = converted, resultMime = mime
+                    DispatchQueue.main.async {
+                        guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token else { return }
+                        self.imageCache.setObject(thumbnail, forKey: id as NSString)
+                        self.insert(image: result, mime: resultMime, source: origin, capturedAt: date, preparedID: id)
+                        if source == "手机截图" {
+                            self.selected = id
+                            self.message = "手机截图已加入历史，也可直接粘贴"
+                        }
+                    }
+                }
+                return
             }
         }
-        if types.contains(.tiff), let data = pb.data(forType: .tiff),
-           let rep = NSBitmapImageRep(data: data), let png = rep.representation(using: .png, properties: [:]) {
-            insert(image: png, mime: NSPasteboard.PasteboardType.png.rawValue, source: origin); return
+        if let text = pb.string(forType: .string), !text.isEmpty {
+            let data = Data(text.utf8)
+            guard data.count <= 20 * 1024 * 1024 else { message = "内容超过 20 MB，未加入历史"; return }
+            processing.async { [weak self] in
+                let id = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                DispatchQueue.main.async {
+                    guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token else { return }
+                    self.insert(text: text, source: origin, capturedAt: date, preparedID: id)
+                }
+            }
         }
-        if let text = pb.string(forType: .string), !text.isEmpty { insert(text: text, source: origin) }
+    }
+
+    private static func thumbnail(_ data: Data) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 1000,
+                kCGImageSourceCreateThumbnailWithTransform: true
+              ] as CFDictionary) else { return nil }
+        return NSImage(cgImage: image, size: .zero)
     }
 
     func image(for clip: Clip) -> NSImage? {
         if let cached = imageCache.object(forKey: clip.id as NSString) { return cached }
-        guard let file = clip.file, let image = NSImage(contentsOf: root.appendingPathComponent(file)) else { return nil }
-        imageCache.setObject(image, forKey: clip.id as NSString)
-        return image
+        guard let file = clip.file, !loadingImages.contains(clip.id) else { return nil }
+        loadingImages.insert(clip.id)
+        let pending = pendingImages[file], url = root.appendingPathComponent(file)
+        processing.async { [weak self] in
+            let image = (pending ?? (try? Data(contentsOf: url))).flatMap { Self.thumbnail($0) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                // Keep failed loads marked until the record is replaced; do not spin on a missing file.
+                if let image { self.imageCache.setObject(image, forKey: clip.id as NSString); self.loadingImages.remove(clip.id); self.imageRevision += 1 }
+            }
+        }
+        return nil
     }
 
-    func copySelected(close: Bool = false) {
+    func imageData(for clip: Clip) -> Data? { clip.file.flatMap { pendingImages[$0] } }
+
+    func copySelected(close: Bool = false, plainText: Bool = false) {
         guard let clip = current else { return }
+        if plainText && clip.isImage { message = "图片不能作为纯文本粘贴"; return }
         let pb = NSPasteboard.general
         if let file = clip.file, let mime = clip.mime {
-            guard let data = try? Data(contentsOf: root.appendingPathComponent(file)) else { message = "图片文件不可用"; return }
+            guard let data = pendingImages[file] ?? (try? Data(contentsOf: root.appendingPathComponent(file))) else { message = "图片文件不可用"; return }
             pb.clearContents()
             guard pb.setData(data, forType: .init(mime)) else { message = "复制图片失败"; return }
         } else if let text = clip.text {
@@ -181,19 +330,8 @@ final class ClipboardStore: ObservableObject {
     }
 
     func delete(_ id: String) {
-        guard let clip = clips.first(where: { $0.id == id }) else { return }
-        let position = visible.firstIndex(where: { $0.id == id }) ?? 0
-        let updated = clips.filter { $0.id != id }
-        guard persist(updated) else { return }
-        clips = updated; imageCache.removeObject(forKey: id as NSString)
-        if selected == id || selected == nil { selected = visible.isEmpty ? nil : visible[min(position, visible.count - 1)].id }
-        // Do not immediately re-import the same phone value during the next polling cycle.
-        if let text = clip.text { lastPhoneText = text }
-        message = "已删除本机记录；设备当前剪贴板未清空"
-        if let file = clip.file {
-            do { try FileManager.default.removeItem(at: root.appendingPathComponent(file)) }
-            catch { message = "记录已删除，但图片文件清理失败：\(error.localizedDescription)" }
-        }
+        if let text = clips.first(where: { $0.id == id })?.text { lastPhoneText = text }
+        deleteMany([id])
     }
 
     func move(_ delta: Int) {
@@ -208,21 +346,71 @@ final class ClipboardStore: ObservableObject {
         selected = visible[number].id; copySelected(close: true)
     }
 
+    func historyPauseChanged() {
+        privacyGeneration = UUID(); lastCount = NSPasteboard.general.changeCount
+        skipPhoneBaseline = true
+    }
+
+    func setPrivacy(minutes: Int?) {
+        writePrivacy(PrivacyState(paused: true, until: minutes.map { Date().timeIntervalSince1970 + Double($0) * 60 }))
+    }
+
+    func resumePrivacy() { writePrivacy(PrivacyState(paused: false, until: nil)) }
+
+    private func writePrivacy(_ value: PrivacyState) {
+        do {
+            try FileManager.default.createDirectory(at: PrivacyState.url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONEncoder().encode(value).write(to: PrivacyState.url, options: .atomic)
+            updatePrivacy()
+            message = value.active ? "隐私暂停已开启，正在结束在途采集" : "隐私暂停已恢复，已跳过暂停期间的内容"
+            refreshConnection()
+        } catch { message = "隐私状态保存失败，未能应用：\(error.localizedDescription)" }
+    }
+
+    func updatePrivacy() {
+        var active = false, label = ""
+        do {
+            if FileManager.default.fileExists(atPath: PrivacyState.url.path) {
+                let value = try JSONDecoder().decode(PrivacyState.self, from: Data(contentsOf: PrivacyState.url))
+                active = value.active
+                if let until = value.until, active {
+                    label = "暂停至 " + Date(timeIntervalSince1970: until).formatted(date: .omitted, time: .shortened)
+                } else if active { label = "已暂停，等待手动恢复" }
+            }
+        } catch { active = true; label = "隐私配置读取失败，已暂停；请手动恢复后重试" }
+        if privacyPaused != active {
+            privacyPaused = active; historyPauseChanged()
+            refreshConnection()
+        }
+        if privacyLabel != label { privacyLabel = label }
+    }
+
     func refreshConnection() {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/HarmonyClipboard/status.json")
-        guard let data = try? Data(contentsOf: url), let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+        let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/HarmonyClipboard")
+        if privacyPaused { online = false; connection = "隐私暂停中"; connectionDetail = privacyLabel; return }
+        guard FileManager.default.fileExists(atPath: base.appendingPathComponent("config.json").path) else {
+            online = false; connection = "尚未配置手机"; connectionDetail = "在设置中填写手机 IP 与无线调试端口"; return
+        }
+        let url = base.appendingPathComponent("status.json")
+        guard let data = try? Data(contentsOf: url), let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            online = false; connection = "同步服务未运行"; connectionDetail = "可在设置中启动同步"; return
+        }
+        lastSync = (value["last_sync"] as? String).map { $0 + " · " + (value["last_direction"] as? String ?? "") } ?? "尚无同步记录"
+        let state = value["state"] as? String
+        if state == "stopped" { online = false; connection = "同步已停止"; connectionDetail = "可手动恢复同步"; return }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let updated = attributes[.modificationDate] as? Date, Date().timeIntervalSince(updated) < 60 else {
-            online = false; connection = "同步服务未运行"; return
+            online = false; connection = "服务状态已过期"; connectionDetail = "后台服务可能退出，尝试立即重连"; return
         }
         online = value["connected"] as? Bool == true
-        let state = value["state"] as? String
-        connection = online ? (state == "phone_read_unavailable" ? "手机已连接 · 读取需解锁" : "手机已连接")
-            : (state == "stopped" ? "同步已停止" : "手机正在重连")
+        connection = online ? (state == "phone_read_unavailable" ? "手机已连接 · 读取需解锁" : "手机已连接") : "手机连接失败 · 重试中"
+        connectionDetail = online ? (state == "phone_read_unavailable" ? "请解锁手机后再取文字" : "文字同步可用") : "检查手机无线调试、授权和 IP／端口；也可立即重连"
     }
 
     func phone(_ action: String, automatic: Bool = false, inputText: String? = nil) {
         guard !busy else { return }
+        if privacyPaused && ["get", "send", "capture", "reconnect"].contains(action) { message = "请先恢复隐私暂停"; return }
+        let requestGeneration = privacyGeneration
         let text = action == "send" ? current?.text : inputText
         if action == "send" && text == nil { message = "这一版支持向手机发送文字"; return }
         if let text, text.utf8.count > 16 * 1024 { message = "手机文字同步最多支持 16 KB"; return }
@@ -253,8 +441,12 @@ final class ClipboardStore: ObservableObject {
                         if !automatic { self.message = reply?["error"] as? String ?? "同步失败，请检查手机连接" }
                         return
                     }
+                    if let value = reply?["panel_autostart"] as? Bool { self.panelAutostart = value }
+                    if let value = reply?["sync_autostart"] as? Bool { self.syncAutostart = value }
+                    if ["get", "capture"].contains(action) && (self.privacyPaused || self.privacyGeneration != requestGeneration) { return }
                     if let value = reply?["text"] as? String {
-                        if automatic && (self.paused || self.lastPhoneText == value) { return }
+                        if automatic && self.skipPhoneBaseline { self.skipPhoneBaseline = false; self.lastPhoneText = value; return }
+                        if automatic && (self.paused || self.privacyPaused || self.lastPhoneText == value) { return }
                         self.lastPhoneText = value
                         self.insert(text: value, source: "鸿蒙手机")
                         if !automatic {
@@ -264,7 +456,7 @@ final class ClipboardStore: ObservableObject {
                     } else if action == "capture" {
                         self.captureClipboard(source: "手机截图", force: true)
                         self.filter = "全部"; self.deviceFilter = "手机"; self.query = ""; self.selected = self.clips.first?.id
-                        self.message = "手机截图已加入历史，也可直接粘贴"
+                        self.message = "手机截图已取回，正在加入历史…"
                     } else { self.message = reply?["message"] as? String ?? "同步完成" }
                     self.refreshConnection()
                 }
@@ -277,217 +469,6 @@ final class ClipboardStore: ObservableObject {
             }
         }
     }
-}
-
-struct Glass: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView(); view.material = .hudWindow
-        view.blendingMode = .behindWindow; view.state = .active
-        view.appearance = NSAppearance(named: .darkAqua)
-        return view
-    }
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
-}
-
-struct PanelView: View {
-    @ObservedObject var store: ClipboardStore
-    @FocusState var searchFocused: Bool
-    @State private var deletionID: String?
-    @State private var confirmsDeletion = false
-    private let accent = Color(red: 0.60, green: 0.68, blue: 1)
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 14) {
-                Image(systemName: "square.on.square").font(.system(size: 23, weight: .medium)).foregroundStyle(accent)
-                HStack {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("搜索剪贴板", text: $store.query).textFieldStyle(.plain).focused($searchFocused)
-                    Text("⌘F").font(.system(size: 12)).foregroundStyle(.tertiary)
-                }.padding(11).background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
-                Spacer(minLength: 8)
-                Button { store.phone("get") } label: {
-                    Label("取手机文字", systemImage: "arrow.down.doc").font(.system(size: 12, weight: .medium))
-                        .padding(.horizontal, 12).padding(.vertical, 10)
-                        .background(accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 10))
-                }.disabled(store.busy).help("读取手机当前文字并加入历史")
-                Button { store.phone("capture") } label: {
-                    Label("手机截图", systemImage: "camera").font(.system(size: 12, weight: .medium))
-                        .padding(.horizontal, 12).padding(.vertical, 10)
-                        .background(accent.opacity(0.16), in: RoundedRectangle(cornerRadius: 10))
-                }.disabled(store.busy).help("截取手机当前屏幕并加入历史")
-                Circle().fill(store.online ? Color.green : Color.orange).frame(width: 6, height: 6)
-                Text(store.connection).font(.system(size: 11)).foregroundStyle(.secondary)
-                Button { store.pinned.toggle() } label: { Image(systemName: store.pinned ? "pin.fill" : "pin") }
-                    .help(store.pinned ? "取消固定面板" : "固定面板").foregroundStyle(store.pinned ? accent : .secondary)
-                    .accessibilityLabel("固定面板")
-                Menu {
-                    Toggle("暂停记录", isOn: $store.paused)
-                    Button("恢复手机同步") { store.phone("start") }.disabled(store.busy)
-                    Button("暂停手机同步") { store.phone("stop") }.disabled(store.busy)
-                    Button("打开历史存储目录") { NSWorkspace.shared.open(store.root) }
-                    Divider()
-                    Text("本机历史最多 100 条 / 100 MB")
-                    Text("单条最多 20 MB · 文字发送最多 16 KB")
-                    Divider()
-                    Button("退出接力剪贴板") { NSApp.terminate(nil) }
-                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("更多")
-                Button { store.configurePhone?() } label: { Image(systemName: "gearshape") }
-                    .help("手机连接设置 · IP 与端口").accessibilityLabel("手机连接设置").disabled(store.busy)
-                Button { store.dismiss?() } label: { Image(systemName: "xmark") }.help("收起 · Esc").accessibilityLabel("收起面板")
-            }.buttonStyle(.plain).padding(.horizontal, 22).padding(.top, 20).padding(.bottom, 14)
-            HStack(spacing: 8) {
-                ForEach(["全部", "文字", "图片", "收藏"], id: \.self) { category in
-                    Button { store.filter = category; store.selected = store.visible.first?.id } label: {
-                        HStack(spacing: 6) {
-                            if category != "全部" { Circle().fill(category == "文字" ? Color.purple : category == "图片" ? Color.green : accent).frame(width: 6, height: 6) }
-                            Text(category).font(.system(size: 13, weight: .medium))
-                        }.padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(store.filter == category ? .white.opacity(0.12) : .clear, in: Capsule())
-                    }.buttonStyle(.plain)
-                }
-                Spacer()
-                Text(store.paused ? "记录已暂停" : "\(store.clips.count) 条记录").font(.system(size: 11)).foregroundStyle(.tertiary)
-            }.padding(.horizontal, 22).padding(.bottom, 16)
-            HStack(spacing: 7) {
-                ForEach(["全部设备", "Mac", "手机"], id: \.self) { device in
-                    Button {
-                        store.deviceFilter = device; store.selected = store.visible.first?.id
-                    } label: {
-                        Label(device, systemImage: device == "Mac" ? "desktopcomputer" : device == "手机" ? "iphone" : "square.stack.3d.up")
-                            .font(.system(size: 11, weight: .medium)).padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(store.deviceFilter == device ? accent.opacity(0.18) : .clear, in: Capsule())
-                    }.buttonStyle(.plain)
-                }
-                Spacer()
-                Text("记录开启后的内容 · 手机文字约 4 秒采集一次").font(.system(size: 10)).foregroundStyle(.tertiary)
-            }.padding(.horizontal, 22).padding(.bottom, 12)
-            HStack(spacing: 18) {
-                history.frame(width: 324)
-                preview.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }.padding(.horizontal, 18)
-            HStack(spacing: 10) {
-                if store.busy { ProgressView().controlSize(.small).scaleEffect(0.75) }
-                Text(store.hotkeyAvailable ? store.message : "Control + X 已被占用，请先释放快捷键后重新启动应用")
-                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(2)
-                Spacer()
-                Text("↑↓ 选择   ↩ 粘贴   ⌃X 呼出").font(.system(size: 10)).foregroundStyle(.tertiary)
-            }.frame(height: 44).padding(.horizontal, 24)
-        }
-        .background { ZStack { Glass(); Color(red: 0.10, green: 0.12, blue: 0.16).opacity(0.70) } }
-        .clipShape(RoundedRectangle(cornerRadius: 24))
-        .overlay(RoundedRectangle(cornerRadius: 24).stroke(.white.opacity(0.16), lineWidth: 1))
-        .preferredColorScheme(.dark)
-        .onReceive(NotificationCenter.default.publisher(for: .init("FocusClipboardSearch"))) { _ in searchFocused = true }
-        .alert("删除这条历史记录？", isPresented: $confirmsDeletion) {
-            Button("取消", role: .cancel) { deletionID = nil }
-            Button("删除", role: .destructive) { if let deletionID { store.delete(deletionID) }; deletionID = nil }
-        } message: {
-            Text("只删除本机历史记录及其图片文件，不会清空 Mac 或手机当前剪贴板。")
-        }
-    }
-
-    var history: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 6) {
-                    if store.visible.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: "doc.on.clipboard").font(.system(size: 30)).foregroundStyle(.tertiary)
-                            Text(store.query.isEmpty ? "复制一段文字或一张图片\n它就会出现在这里" : "没有匹配的记录")
-                                .font(.system(size: 13)).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        }.frame(maxWidth: .infinity).padding(.top, 70)
-                    }
-                    ForEach(Array(store.visible.enumerated()), id: \.element.id) { index, clip in
-                        HStack(spacing: 12) {
-                            Text(index < 9 ? "⌘\(index + 1)" : " ").font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.tertiary).frame(width: 24)
-                            if clip.isImage {
-                                if let image = store.image(for: clip) {
-                                    Image(nsImage: image).resizable().scaledToFit().frame(width: 38, height: 48).clipShape(RoundedRectangle(cornerRadius: 4))
-                                } else { Image(systemName: "photo").frame(width: 38) }
-                            }
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(clip.title).font(.system(size: 13, weight: .medium)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-                                HStack(spacing: 4) {
-                                    Text(clip.deviceLabel).lineLimit(1)
-                                    Text("·")
-                                    Text(clip.date, style: .relative).lineLimit(1)
-                                    if clip.favorite { Image(systemName: "star.fill").foregroundStyle(accent) }
-                                    if clip.pinnedAt != nil { Image(systemName: "pin.fill").foregroundStyle(accent).accessibilityLabel("已置顶") }
-                                }.font(.system(size: 10)).foregroundStyle(.secondary)
-                            }
-                            if !clip.isImage {
-                                Button {
-                                    store.selected = clip.id
-                                    store.phone("send")
-                                } label: {
-                                    Image(systemName: "paperplane").font(.system(size: 13))
-                                        .foregroundStyle(accent).frame(width: 28, height: 32)
-                                }.buttonStyle(.plain).disabled(store.busy)
-                                    .help("发送这条文字到手机剪贴板")
-                                    .accessibilityLabel("发送这条文字到手机")
-                            }
-                        }.padding(12).frame(minHeight: 70)
-                            .background(store.current?.id == clip.id ? accent.opacity(0.19) : .white.opacity(0.025), in: RoundedRectangle(cornerRadius: 13))
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) { store.selected = clip.id; store.copySelected(close: true) }
-                            // Select immediately instead of waiting for the double-click interval.
-                            .simultaneousGesture(TapGesture().onEnded { store.selected = clip.id })
-                            .accessibilityElement(children: .contain)
-                            .accessibilityLabel(clip.title)
-                            .accessibilityAddTraits(.isButton)
-                            .accessibilityAction { store.selected = clip.id }
-                            .contextMenu {
-                                Button(clip.pinnedAt == nil ? "置顶" : "取消置顶") { store.togglePin(clip.id) }
-                                Button("复制") { store.selected = clip.id; store.copySelected() }
-                                Button("删除记录", role: .destructive) { deletionID = clip.id; confirmsDeletion = true }
-                            }
-                            .id(clip.id)
-                    }
-                }
-            }.onChange(of: store.selected) { _, value in if let value { proxy.scrollTo(value) } }
-        }
-    }
-
-    var preview: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(store.current?.isImage == true ? "图片预览" : "内容预览").font(.system(size: 11)).foregroundStyle(.secondary)
-                Spacer()
-                Button { if let id = store.current?.id { store.togglePin(id) } } label: { Image(systemName: store.current?.pinnedAt == nil ? "pin" : "pin.fill") }
-                    .help("置顶 / 取消置顶记录").accessibilityLabel("置顶所选记录").disabled(store.current == nil)
-                Button { store.favoriteSelected() } label: { Image(systemName: store.current?.favorite == true ? "star.fill" : "star") }
-                    .help("收藏 / 取消收藏").accessibilityLabel("收藏所选内容").disabled(store.current == nil)
-                Button { store.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-                    .help("复制到 Mac 剪贴板").disabled(store.current == nil)
-                Button { store.copySelected(close: true) } label: { Label("粘贴", systemImage: "arrow.up.forward.app") }
-                    .help("粘贴到呼出面板前的应用 · 回车").disabled(store.current == nil)
-                Button { deletionID = store.current?.id; confirmsDeletion = true } label: { Image(systemName: "trash") }
-                    .help("删除所选记录").accessibilityLabel("删除所选记录").disabled(store.current == nil)
-            }.buttonStyle(.plain).foregroundStyle(accent).padding(18)
-            if let clip = store.current {
-                if clip.isImage, let image = store.image(for: clip) {
-                    Image(nsImage: image).resizable().scaledToFit().padding(.horizontal, 22).padding(.bottom, 12).frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView { Text(clip.text ?? "图片文件不可用").font(.system(size: 16)).lineSpacing(6).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 22).padding(.bottom, 20) }.frame(maxHeight: .infinity)
-                }
-                HStack(spacing: 8) {
-                    Image(systemName: clip.isImage ? "photo" : "text.alignleft")
-                    Text(clip.deviceLabel + " · " + clip.source)
-                    Text("·")
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(clip.bytes), countStyle: .file))
-                    Spacer()
-                }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 18).padding(.vertical, 10)
-            } else {
-                VStack(spacing: 14) {
-                    Image(systemName: "rectangle.on.rectangle").font(.system(size: 44, weight: .ultraLight)).foregroundStyle(accent.opacity(0.6))
-                    Text("选一条内容，接着用").font(.system(size: 18, weight: .medium))
-                    Text("文字可双向同步，手机画面可一键取回").font(.system(size: 12)).foregroundStyle(.secondary)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }.background(Color.black.opacity(0.25), in: RoundedRectangle(cornerRadius: 20))
-            .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.065), lineWidth: 1))
-    }
-
 }
 
 final class FloatingPanel: NSPanel {
@@ -509,6 +490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         let menu = NSMenu()
         let appItem = NSMenuItem(); let appMenu = NSMenu(title: "接力剪贴板")
         appMenu.addItem(withTitle: "退出接力剪贴板", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -530,7 +512,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.contentView = NSHostingView(rootView: PanelView(store: store))
         store.dismiss = { [weak self] in self?.hide(restoreFocus: true) }
         store.paste = { [weak self] in self?.pasteIntoPreviousApp() }
-        store.configurePhone = { [weak self] in self?.showPhoneSettings() }
+        store.configurePhone = { [weak self] in self?.store.settingsPresented = true }
+        store.changeHotkey = { [weak self] preference in self?.registerShortcut(preference) ?? false }
+        NotificationCenter.default.addObserver(self, selector: #selector(showPhoneSettings), name: .init("EditPhoneEndpoint"), object: nil)
         // Menu-bar clicks can activate this app before show() runs; remember the last external app.
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
@@ -548,8 +532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let delegate = Unmanaged<AppDelegate>.fromOpaque(pointer).takeUnretainedValue()
             delegate.toggle(); return noErr
         }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
-        let id = EventHotKeyID(signature: 0x48434C50, id: 1)
-        store.hotkeyAvailable = RegisterEventHotKey(UInt32(kVK_ANSI_X), UInt32(controlKey), id, GetApplicationEventTarget(), 0, &hotKey) == noErr
+        store.hotkeyAvailable = registerShortcut(store.preferences)
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.panel.isKeyWindow, self.panel.attachedSheet == nil, NSApp.modalWindow == nil else { return event }
             if event.keyCode == 53 { self.hide(restoreFocus: true); return nil }
@@ -563,14 +546,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if event.keyCode == 126 { self.store.move(-1); return nil }
             if event.keyCode == 36 {
                 if let editor = self.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return event }
-                self.store.copySelected(close: true); return nil
+                self.store.copySelected(close: true, plainText: event.modifierFlags.contains(.shift)); return nil
             }
             return event
         }
         // Keep login launches quiet; the hotkey and menu-bar button reveal the panel.
     }
 
-    @objc func toggle() { panel.isVisible ? hide(restoreFocus: true) : show() }
+    func registerShortcut(_ preference: PanelPreferences) -> Bool {
+        if hotKey != nil && preference.letter == store.preferences.letter && preference.modifier == store.preferences.modifier { return true }
+        var candidate: EventHotKeyRef?
+        let id = EventHotKeyID(signature: 0x48434C50, id: 1)
+        guard RegisterEventHotKey(preference.keyCode, preference.modifierMask, id, GetApplicationEventTarget(), 0, &candidate) == noErr else { return false }
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        hotKey = candidate
+        statusItem.button?.toolTip = "接力剪贴板 · " + preference.shortcutLabel
+        return true
+    }
+    @objc func toggle() {
+        if panel.attachedSheet != nil { NSApp.activate(ignoringOtherApps: true); panel.makeKeyAndOrderFront(nil); return }
+        panel.isVisible ? hide(restoreFocus: true) : show()
+    }
     func show() {
         pasteGeneration = UUID()
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ProcessInfo.processInfo.processIdentifier { previousApp = front }
@@ -629,10 +625,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             previousApp.activate(options: [])
         }
     }
-    func windowDidResignKey(_ notification: Notification) { if !store.pinned && !configuringPhone { hide(restoreFocus: false) } }
+    func windowDidResignKey(_ notification: Notification) { if !store.pinned && !configuringPhone && panel.attachedSheet == nil { hide(restoreFocus: false) } }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { if !flag { show() }; return true }
     func applicationWillTerminate(_ notification: Notification) {
         pasteGeneration = UUID()
+        store.flushHistory()
+        NotificationCenter.default.removeObserver(self)
         if let activationObserver { NSWorkspace.shared.notificationCenter.removeObserver(activationObserver) }
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let handler { RemoveEventHandler(handler) }
@@ -644,4 +642,9 @@ umask(0o077)
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
+// Installer upgrades send SIGTERM; flush history even if an open sheet prevents AppKit termination.
+signal(SIGTERM, SIG_IGN)
+let terminationSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+terminationSignal.setEventHandler { delegate.store.flushHistory(); exit(EXIT_SUCCESS) }
+terminationSignal.resume()
 app.run()

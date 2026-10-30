@@ -1,7 +1,7 @@
 import AppKit
 
 extension AppDelegate {
-    func showPhoneSettings() {
+    @objc func showPhoneSettings() {
         guard !configuringPhone else { return }
         configuringPhone = true
         defer { configuringPhone = false }
@@ -36,7 +36,7 @@ extension AppDelegate {
         port.widthAnchor.constraint(equalToConstant: 340).isActive = true
         let alert = NSAlert()
         alert.messageText = "手机连接设置"
-        alert.informativeText = "手机和 Mac 需在同一局域网。请从手机“开发者选项 → 无线调试”填写当前 IP 和端口；端口变化后需在这里更新。保存会启用手机同步及其登录自启。"
+        alert.informativeText = "手机和 Mac 需在同一局域网。请从手机“开发者选项 → 无线调试”填写当前 IP 和端口；端口变化后需在这里更新。保存会连接手机；登录自启由设置中的开关控制。"
         alert.accessoryView = fields
         alert.addButton(withTitle: "保存并连接")
         alert.addButton(withTitle: "取消")

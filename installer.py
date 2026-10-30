@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -92,9 +93,13 @@ def main():
         shutil.copytree(source, staged)
         subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(staged)],
                        check=True, timeout=20)
+        disabled = launch('print-disabled', DOMAIN).stdout.decode('utf-8')
+        panel_disabled = re.search(r'"' + re.escape(PANEL) + r'"\s*=>\s*(?:true|disabled)\b', disabled) is not None
+        sync_disabled = re.search(r'"' + re.escape(SYNC) + r'"\s*=>\s*(?:true|disabled)\b', disabled) is not None
+        sync_was_loaded = launch('print', DOMAIN + '/' + SYNC, check=False).returncode == 0
         unload(PANEL)
-        unload(SYNC)
         stop_panel()
+        unload(SYNC)
         previous = Path(staging) / 'previous.app'
         if APP.exists():
             APP.rename(previous)
@@ -126,14 +131,21 @@ def main():
             EnvironmentVariables={'LANG': 'en_US.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'},
             StandardErrorPath='/dev/null', StandardOutPath='/dev/null'))
         launch('enable', DOMAIN + '/' + PANEL)
-        launch('bootstrap', DOMAIN, str(AGENTS / (PANEL + '.plist')))
-        # Honor a deliberately paused service. A new install starts it via Settings after pairing.
-        disabled = launch('print-disabled', DOMAIN).stdout.decode('utf-8')
-        sync_disabled = '"' + SYNC + '" => true' in disabled
-        if (ROOT / 'config.json').exists() and (ROOT / 'bin/hdc').exists() and not sync_disabled:
-            launch('bootstrap', DOMAIN, str(AGENTS / (SYNC + '.plist')))
+        try:
+            launch('bootstrap', DOMAIN, str(AGENTS / (PANEL + '.plist')))
+        finally:
+            if panel_disabled:
+                launch('disable', DOMAIN + '/' + PANEL)
+        # Preserve both login preference and the currently running/stopped sync state on upgrade.
+        if sync_was_loaded and (ROOT / 'config.json').exists() and (ROOT / 'bin/hdc').exists():
+            launch('enable', DOMAIN + '/' + SYNC)
+            try:
+                launch('bootstrap', DOMAIN, str(AGENTS / (SYNC + '.plist')))
+            finally:
+                if sync_disabled:
+                    launch('disable', DOMAIN + '/' + SYNC)
     print('已安装到 ~/Applications/接力剪贴板.app，登录后后台启动。')
-    print('按 Control+X 呼出，点击齿轮设置手机 IP 和端口。')
+    print('按已配置的快捷键（默认 Control+X）呼出；也可点击菜单栏图标。')
     if not (ROOT / 'bin/hdc').exists():
         print('尚未安装 hdc：目前只能使用本机面板。请使用 --hdc 参数重新运行安装程序。')
 
