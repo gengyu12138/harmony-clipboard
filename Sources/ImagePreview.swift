@@ -8,6 +8,7 @@ struct ClipboardImagePreview: View {
     let root: URL
     let pendingData: Data?
     let copyText: (String) -> Bool
+    let recognizedText: (String) -> Void
     @State private var image: NSImage?
     @State private var analysis: ImageAnalysis?
     @State private var selectedText = ""
@@ -77,6 +78,7 @@ struct ClipboardImagePreview: View {
                 let result = try await ImageAnalyzer().analyze(loaded, orientation: .up, configuration: configuration)
                 guard !Task.isCancelled else { return }
                 analysis = result; recognizing = false
+                recognizedText(result.transcript)
                 recognition = result.transcript.isEmpty ? "未识别到文字；滚轮或双指捏合缩放" : "拖选文字按 ⌘C；滚轮 / 双指捏合缩放，双指滑动平移"
             } catch {
                 guard !Task.isCancelled else { return }

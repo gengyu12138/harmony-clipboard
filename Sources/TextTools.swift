@@ -1,22 +1,6 @@
 import AppKit
 import SwiftUI
-
-struct SnippetGroup: Codable, Identifiable, Equatable {
-    var id = UUID().uuidString
-    var name: String
-}
-
-struct Snippet: Codable, Identifiable, Equatable {
-    var id = UUID().uuidString
-    var groupID: String?
-    var title: String
-    var text: String
-}
-
-struct SnippetLibrary: Codable {
-    var groups: [SnippetGroup] = []
-    var items: [Snippet] = []
-}
+import UniformTypeIdentifiers
 
 final class SnippetStore: ObservableObject {
     @Published private(set) var library = SnippetLibrary()
@@ -28,7 +12,9 @@ final class SnippetStore: ObservableObject {
         url = root.appendingPathComponent("snippets.json")
         do {
             if FileManager.default.fileExists(atPath: url.path) {
-                library = try JSONDecoder().decode(SnippetLibrary.self, from: Data(contentsOf: url))
+                let loaded = try JSONDecoder().decode(SnippetLibrary.self, from: Data(contentsOf: url))
+                try SnippetBackupCodec.validate(loaded)
+                library = loaded
             }
         } catch { writable = false; self.error = "片段库读取失败，原文件保留，暂不允许覆盖。" }
     }
@@ -37,12 +23,44 @@ final class SnippetStore: ObservableObject {
     func save(_ library: SnippetLibrary) -> Bool {
         guard writable else { return false }
         do {
+            try SnippetBackupCodec.validate(library)
             let data = try JSONEncoder().encode(library)
-            guard data.count <= 2 * 1024 * 1024 else { error = "片段库最多 2 MB，请精简后保存。"; return false }
             try data.write(to: url, options: .atomic)
             self.library = library; error = ""
             return true
         } catch { self.error = "保存失败，原片段保留：\(error.localizedDescription)"; return false }
+    }
+
+    func exportBackup(completion: @escaping (String) -> Void) {
+        guard writable else { return }
+        let data: Data
+        do { data = try SnippetBackupCodec.encode(library) }
+        catch { self.error = error.localizedDescription; return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = "接力剪贴板-常用片段.json"
+        panel.message = "明文 JSON 备份，仅包含常用片段和分组，请妥善保管。"; panel.prompt = "导出备份"
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try data.write(to: url, options: .atomic); self?.error = ""; completion("常用片段已导出") }
+            catch { self?.error = "导出失败：\(error.localizedDescription)" }
+        }
+    }
+
+    func importBackup(completion: @escaping (String) -> Void) {
+        guard writable else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = "合并加入片段库，现有内容保留；同组同标题同内容的片段跳过。"; panel.prompt = "合并导入"
+        panel.begin { [weak self] response in
+            guard response == .OK, let self, let url = panel.url else { return }
+            do {
+                let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                guard let size, size <= SnippetBackupCodec.fileLimit else { throw TextToolError(message: "备份文件过大或大小不可读，未导入。") }
+                let incoming = try SnippetBackupCodec.decode(Data(contentsOf: url, options: .mappedIfSafe))
+                let merged = try SnippetBackupCodec.merge(incoming, into: self.library)
+                if self.save(merged.library) { completion("已导入 \(merged.items) 条片段、\(merged.groups) 个分组；重复内容已跳过") }
+            } catch { self.error = "导入失败，原片段保留：\(error.localizedDescription)" }
+        }
     }
 }
 
@@ -86,6 +104,7 @@ struct SnippetsView: View {
     let seed: String?
     @Environment(\.dismiss) private var dismiss
     @State private var groupID: String?
+    @State private var allGroups = true
     @State private var selected: String?
     @State private var draft = Snippet(title: "", text: "")
     @State private var query = ""
@@ -97,7 +116,7 @@ struct SnippetsView: View {
     private var original: Snippet? { snippets.library.items.first { $0.id == selected } }
     private var dirty: Bool { original.map { $0 != draft } ?? (!draft.text.isEmpty || !draft.title.isEmpty) }
     private var items: [Snippet] {
-        snippets.library.items.filter { $0.groupID == groupID && (query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) || $0.text.localizedCaseInsensitiveContains(query)) }
+        snippets.library.items.filter { (allGroups || $0.groupID == groupID) && (query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) || $0.text.localizedCaseInsensitiveContains(query)) }
     }
     var body: some View {
         VStack(spacing: 16) {
@@ -105,11 +124,18 @@ struct SnippetsView: View {
                 Text("常用片段").font(.system(size: 20, weight: .semibold))
                 Text("单独保存 · 不随历史清理").font(.system(size: 12)).foregroundStyle(RelayTheme.secondary)
                 Spacer()
+                Menu("备份") {
+                    Button("导出备份…") { snippets.exportBackup { notice = $0 } }
+                    Button("合并导入…") { snippets.importBackup { notice = $0 } }
+                }.menuStyle(.borderlessButton).fixedSize().disabled(dirty).accessibilityLabel("常用片段备份")
                 Button("新建片段") { selected = nil; draft = Snippet(groupID: groupID, title: "", text: "") }.buttonStyle(RelayButtonStyle()).disabled(dirty)
                 RelayIconButton(title: "关闭片段库", symbol: "xmark") { dismiss() }.disabled(dirty)
             }
             HStack(alignment: .top, spacing: 14) {
                 VStack(alignment: .leading, spacing: 6) {
+                    Button { allGroups = true; groupID = nil; selected = nil; draft = Snippet(title: "", text: ""); query = "" } label: {
+                        Label("全部片段", systemImage: "square.stack").frame(maxWidth: .infinity, alignment: .leading)
+                    }.buttonStyle(RelayButtonStyle(selected: allGroups, quiet: true)).disabled(dirty)
                     groupButton("未分组", id: nil)
                     ScrollView {
                         VStack(spacing: 6) {
@@ -117,13 +143,13 @@ struct SnippetsView: View {
                         }
                     }
                     Button("新建分组") { groupDraft = SnippetGroup(name: "") }.buttonStyle(RelayButtonStyle()).disabled(dirty)
-                    if groupID != nil {
+                    if !allGroups && groupID != nil {
                         Button("重命名分组") { groupDraft = snippets.library.groups.first { $0.id == groupID } }.buttonStyle(RelayButtonStyle()).disabled(dirty)
                         Button("删除分组") { deleteKind = "group"; confirmDelete = true }.buttonStyle(RelayButtonStyle(destructive: true)).disabled(dirty)
                     }
                 }.frame(width: 140)
                 VStack(spacing: 10) {
-                    TextField("搜索当前分组", text: $query).textFieldStyle(.roundedBorder)
+                    TextField(allGroups ? "搜索全部片段" : "搜索当前分组", text: $query).textFieldStyle(.roundedBorder)
                     ScrollView {
                         LazyVStack(spacing: 5) {
                             ForEach(items) { item in
@@ -134,7 +160,7 @@ struct SnippetsView: View {
                                     }.frame(maxWidth: .infinity, alignment: .leading)
                                 }.buttonStyle(RelayButtonStyle(selected: item.id == selected, quiet: true)).disabled(dirty)
                             }
-                            if items.isEmpty { Text("这个分组还没有匹配的片段").font(.system(size: 12)).foregroundStyle(RelayTheme.muted).padding(.top, 30) }
+                            if items.isEmpty { Text(query.isEmpty ? "还没有常用片段" : "没有匹配的片段").font(.system(size: 12)).foregroundStyle(RelayTheme.muted).padding(.top, 30) }
                         }
                     }
                 }.frame(width: 200)
@@ -186,9 +212,9 @@ struct SnippetsView: View {
             } message: { Text(deleteKind == "group" ? "片段会移到“未分组”，内容保留。" : "仅删除常用片段，原历史不受影响；删除后无法撤销。") }
     }
     private func groupButton(_ title: String, id: String?) -> some View {
-        Button { groupID = id; selected = nil; draft = Snippet(groupID: id, title: "", text: ""); query = "" } label: {
+        Button { allGroups = false; groupID = id; selected = nil; draft = Snippet(groupID: id, title: "", text: ""); query = "" } label: {
             Label(title, systemImage: "folder").frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
-        }.buttonStyle(RelayButtonStyle(selected: groupID == id, quiet: true)).disabled(dirty)
+        }.buttonStyle(RelayButtonStyle(selected: !allGroups && groupID == id, quiet: true)).disabled(dirty)
     }
     private func saveSnippet() {
         guard draft.text.utf8.count <= 64 * 1024 else { snippets.error = "单个片段最多 64 KB。"; return }

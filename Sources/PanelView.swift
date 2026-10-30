@@ -14,6 +14,7 @@ struct PanelView: View {
     @State private var expandedClip: Clip?
     @State private var editingClip: Clip?
     @State private var snippetRequest: SnippetRequest?
+    @State private var merging = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,13 +28,14 @@ struct PanelView: View {
             footer
         }
         .modifier(GlassShell())
+        .onAppear { searchFocused = true }
         .onChange(of: store.paused) { _, _ in store.historyPauseChanged() }
         .onChange(of: store.current?.id) { _, _ in store.previewDraft = nil }
         .sheet(isPresented: $store.settingsPresented) {
             SettingsView(store: store).presentationBackground(.clear)
         }
         .sheet(item: $expandedClip) { clip in
-            ExpandedPreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) }).presentationBackground(.clear)
+            ExpandedPreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) }, recognizedText: { store.cacheImageText($0, for: clip.id) }).presentationBackground(.clear)
         }
         .sheet(item: $editingClip) { clip in
             TemporaryEdit(original: clip.text ?? "", copy: { store.copyText($0, paste: $1) }).presentationBackground(.clear)
@@ -41,6 +43,7 @@ struct PanelView: View {
         .sheet(item: $snippetRequest) { request in
             SnippetsView(snippets: store.snippets, store: store, seed: request.text).presentationBackground(.clear)
         }
+        .sheet(isPresented: $merging) { TextMergeView(store: store).presentationBackground(.clear) }
         .onReceive(NotificationCenter.default.publisher(for: .init("FocusClipboardSearch"))) { _ in searchFocused = true }
         .alert("删除这条历史记录？", isPresented: $confirmsDeletion) {
             Button("取消", role: .cancel) { deletionID = nil }
@@ -73,8 +76,9 @@ struct PanelView: View {
         HStack(spacing: 10) {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").font(.system(size: 15)).foregroundStyle(RelayTheme.secondary)
-                TextField("搜索文字、来源…", text: $store.query).textFieldStyle(.plain)
+                TextField("搜索文字、图片文字、来源…", text: $store.query).textFieldStyle(.plain)
                     .font(.system(size: 14)).focused($searchFocused).accessibilityLabel("搜索剪贴板")
+                    .help("搜索已识别的图片文字；旧缓存可能被回收，重新打开图片可重建索引。未打开的图片不会自动扫描。")
                 if !store.query.isEmpty {
                     Button { store.query = "" } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).foregroundStyle(RelayTheme.muted).accessibilityLabel("清空搜索")
@@ -133,6 +137,8 @@ struct PanelView: View {
 
     private var moreMenu: some View {
         Menu {
+            Button("合并多条文字…") { merging = true }.disabled(store.clips.filter { $0.text?.isEmpty == false }.count < 2)
+            Divider()
             Toggle("暂停历史记录", isOn: $store.paused)
             Button("启动手机同步") { store.phone("start") }.disabled(store.busy)
             Button("停止手机同步") { store.phone("stop") }.disabled(store.busy)
@@ -147,10 +153,12 @@ struct PanelView: View {
     }
 
     private var history: some View {
-        ScrollViewReader { proxy in
+        let records = store.visible
+        let selectedID = records.first(where: { $0.id == store.selected })?.id ?? records.first?.id
+        return ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 4) {
-                    if store.visible.isEmpty {
+                    if records.isEmpty {
                         VStack(spacing: 12) {
                             Image(systemName: store.query.isEmpty ? "doc.on.clipboard" : "magnifyingglass").font(.system(size: 28, weight: .light))
                             Text(store.query.isEmpty ? "从一次复制开始" : "没有找到匹配内容").font(.system(size: 14, weight: .medium))
@@ -158,15 +166,15 @@ struct PanelView: View {
                                 .font(.system(size: 12)).multilineTextAlignment(.center)
                         }.foregroundStyle(RelayTheme.secondary).padding(.horizontal, 20).frame(maxWidth: .infinity).padding(.top, 64)
                     }
-                    ForEach(Array(store.visible.enumerated()), id: \.element.id) { index, clip in
-                        historyRow(clip, index: index).id(clip.id)
+                    ForEach(Array(records.enumerated()), id: \.element.id) { index, clip in
+                        historyRow(clip, index: index, selected: selectedID == clip.id).id(clip.id)
                     }
                 }.padding(.trailing, 4)
             }.onChange(of: store.selected) { _, value in if let value { proxy.scrollTo(value) } }
         }
     }
 
-    private func historyRow(_ clip: Clip, index: Int) -> some View {
+    private func historyRow(_ clip: Clip, index: Int, selected: Bool) -> some View {
         HStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05))
@@ -196,7 +204,7 @@ struct PanelView: View {
                 }
             }.frame(width: 26)
         }.padding(.horizontal, 11).padding(.vertical, 10).frame(minHeight: 70)
-            .modifier(RelayRow(selected: store.current?.id == clip.id)).contentShape(Rectangle())
+            .modifier(RelayRow(selected: selected)).contentShape(Rectangle())
             .onTapGesture(count: 2) { store.selected = clip.id; store.copySelected(close: true) }
             // Immediate selection must not wait for the double-click interval.
             .simultaneousGesture(TapGesture().onEnded { store.selected = clip.id })
@@ -205,6 +213,7 @@ struct PanelView: View {
             .contextMenu {
                 Button(clip.pinnedAt == nil ? "置顶" : "取消置顶") { store.togglePin(clip.id) }
                 Button("复制") { store.selected = clip.id; store.copySelected() }
+                if let text = clip.imageText, !text.isEmpty { Button("复制图片识别文字") { _ = store.copyText(text) } }
                 if let text = clip.text {
                     Button("存为常用片段") { snippetRequest = SnippetRequest(text: text) }
                     Button("编辑后粘贴") { editingClip = clip }
@@ -214,31 +223,33 @@ struct PanelView: View {
     }
 
     private var preview: some View {
-        VStack(spacing: 0) {
+        let selectedClip = store.current
+        let hasContent = selectedClip.map { $0.isImage || !store.previewText(for: $0).isEmpty } ?? false
+        return VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Text(store.current?.isImage == true ? "图片预览" : "内容预览").font(.system(size: 12, weight: .medium)).foregroundStyle(RelayTheme.secondary)
+                Text(selectedClip?.isImage == true ? "图片预览" : "内容预览").font(.system(size: 12, weight: .medium)).foregroundStyle(RelayTheme.secondary)
                 Spacer()
-                if let clip = store.current, clip.text != nil {
+                if let clip = selectedClip, clip.text != nil {
                     RelayIconButton(title: "存为常用片段", symbol: "text.badge.plus") { snippetRequest = SnippetRequest(text: store.previewText(for: clip)) }
                 }
-                RelayIconButton(title: "置顶所选记录", symbol: store.current?.pinnedAt == nil ? "pin" : "pin.fill", selected: store.current?.pinnedAt != nil) {
-                    if let id = store.current?.id { store.togglePin(id) }
-                }.disabled(store.current == nil)
-                RelayIconButton(title: "收藏所选内容", symbol: store.current?.favorite == true ? "star.fill" : "star", selected: store.current?.favorite == true) { store.favoriteSelected() }.disabled(store.current == nil)
+                RelayIconButton(title: "置顶所选记录", symbol: selectedClip?.pinnedAt == nil ? "pin" : "pin.fill", selected: selectedClip?.pinnedAt != nil) {
+                    if let id = selectedClip?.id { store.togglePin(id) }
+                }.disabled(selectedClip == nil)
+                RelayIconButton(title: "收藏所选内容", symbol: selectedClip?.favorite == true ? "star.fill" : "star", selected: selectedClip?.favorite == true) { store.favoriteSelected() }.disabled(selectedClip == nil)
                 RelayIconButton(title: "展开预览", symbol: "arrow.up.left.and.arrow.down.right") {
-                    guard var clip = store.current else { return }
+                    guard var clip = selectedClip else { return }
                     if clip.text != nil {
                         let text = store.previewText(for: clip)
                         clip.text = text; clip.bytes = text.utf8.count
                     }
                     expandedClip = clip
-                }.disabled(store.current == nil)
-                RelayIconButton(title: "删除所选记录", symbol: "trash", destructive: true) { deletionID = store.current?.id; confirmsDeletion = true }.disabled(store.current == nil)
+                }.disabled(selectedClip == nil)
+                RelayIconButton(title: "删除所选记录", symbol: "trash", destructive: true) { deletionID = selectedClip?.id; confirmsDeletion = true }.disabled(selectedClip == nil)
             }.padding(14)
             Rectangle().fill(RelayTheme.line).frame(height: 0.5).padding(.horizontal, 16)
-            if let clip = store.current {
+            if let clip = selectedClip {
                 if clip.isImage {
-                    ClipboardImagePreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) })
+                    ClipboardImagePreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) }, recognizedText: { store.cacheImageText($0, for: clip.id) })
                         .id(clip.id).padding(12)
                 } else {
                     VStack(spacing: 4) {
@@ -246,8 +257,13 @@ struct PanelView: View {
                             store.previewDraft = (clip.id, $0)
                         }).id(clip.id).accessibilityLabel("预览文字，可直接编辑")
                         HStack {
-                            Text("直接编辑 · 仅用于本次复制或粘贴").font(.system(size: 10)).foregroundStyle(RelayTheme.muted)
+                            Text("\(store.previewText(for: clip).count) 字符 · 临时编辑").font(.system(size: 10)).foregroundStyle(RelayTheme.muted)
                             Spacer()
+                            Menu("整理文字") {
+                                ForEach(TextTransform.allCases) { action in
+                                    Button(action.rawValue) { store.previewDraft = (clip.id, action.apply(to: store.previewText(for: clip))) }
+                                }
+                            }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 11)).accessibilityLabel("整理预览文字")
                             if store.previewDraft?.id == clip.id {
                                 Button("还原") { store.previewDraft = nil }.buttonStyle(RelayButtonStyle(quiet: true))
                             }
@@ -270,13 +286,13 @@ struct PanelView: View {
             Rectangle().fill(RelayTheme.line).frame(height: 0.5)
             HStack(spacing: 8) {
                 Button { store.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }.buttonStyle(RelayButtonStyle())
-                    .help("复制到 Mac 剪贴板").disabled(store.current == nil)
+                    .help("复制到 Mac 剪贴板").disabled(!hasContent)
                 Button { store.copySelected(close: true, plainText: true) } label: { Text("纯文本粘贴") }.buttonStyle(RelayButtonStyle())
-                    .help("Shift+回车").disabled(store.current == nil || store.current?.isImage == true)
+                    .help("Shift+回车").disabled(!hasContent || selectedClip?.isImage == true)
                 Spacer()
                 Button { store.copySelected(close: true) } label: {
                     HStack(spacing: 12) { Text("粘贴"); Image(systemName: "return") }
-                }.buttonStyle(RelayButtonStyle(prominent: true)).help("粘贴到呼出面板前的应用").disabled(store.current == nil)
+                }.buttonStyle(RelayButtonStyle(prominent: true)).help("粘贴到呼出面板前的应用").disabled(!hasContent)
             }.padding(14)
         }.background(.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 15))
             .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(RelayTheme.line, lineWidth: 0.5))

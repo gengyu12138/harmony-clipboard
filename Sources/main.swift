@@ -5,23 +5,6 @@ import CryptoKit
 import ApplicationServices
 import ImageIO
 
-struct Clip: Codable, Identifiable {
-    var id: String
-    var text: String?
-    var file: String?
-    var mime: String?
-    var source: String
-    var date: Date
-    var bytes: Int
-    var favorite = false
-    var pinnedAt: Date? = nil
-    var devices: [String]? = nil
-    var isImage: Bool { file != nil }
-    var recordedDevices: [String] { devices ?? (["鸿蒙手机", "手机截图"].contains(source) ? ["手机"] : ["Mac"]) }
-    var deviceLabel: String { recordedDevices.joined(separator: " · ") }
-    var title: String { text.map { String($0.prefix(180)).replacingOccurrences(of: "\n", with: " ") } ?? "图片 · \(source)" }
-}
-
 final class ClipboardStore: ObservableObject {
     @Published var clips: [Clip] = []
     @Published var selected: String?
@@ -73,7 +56,7 @@ final class ClipboardStore: ObservableObject {
         clips.filter {
             (filter == "全部" || filter == "文字" && !$0.isImage || filter == "图片" && $0.isImage || filter == "收藏" && $0.favorite)
             && (deviceFilter == "全部设备" || $0.recordedDevices.contains(deviceFilter))
-            && (query.isEmpty || ($0.text ?? $0.title).localizedCaseInsensitiveContains(query) || $0.source.localizedCaseInsensitiveContains(query))
+            && $0.matches(query)
         }.sorted {
             if let left = $0.pinnedAt, let right = $1.pinnedAt { return left > right }
             if ($0.pinnedAt != nil) != ($1.pinnedAt != nil) { return $0.pinnedAt != nil }
@@ -308,6 +291,13 @@ final class ClipboardStore: ObservableObject {
     func previewText(for clip: Clip) -> String {
         if let draft = previewDraft, draft.id == clip.id { return draft.text }
         return clip.text ?? ""
+    }
+
+    func cacheImageText(_ text: String, for id: String) {
+        guard historyWritable, !paused, !privacyPaused, !applicationExcluded else { return }
+        var updated = clips
+        guard ImageTextIndex.record(text, for: id, in: &updated) else { return }
+        clips = updated; persist()
     }
 
     @discardableResult
@@ -623,6 +613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel.setFrameOrigin(NSPoint(x: f.midX - panel.frame.width / 2, y: f.midY - panel.frame.height / 2))
         }
         NSApp.activate(ignoringOtherApps: true); panel.makeKeyAndOrderFront(nil)
+        NotificationCenter.default.post(name: .init("FocusClipboardSearch"), object: nil)
     }
     private func pasteIntoPreviousApp() {
         guard let target = previousApp, !target.isTerminated else {

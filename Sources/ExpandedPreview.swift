@@ -41,6 +41,7 @@ struct ExpandedPreview: View {
     let root: URL
     let pendingData: Data?
     let copyText: (String) -> Bool
+    let recognizedText: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         VStack(spacing: 16) {
@@ -51,7 +52,7 @@ struct ExpandedPreview: View {
             }
             Group {
               if clip.isImage {
-                ClipboardImagePreview(clip: clip, root: root, pendingData: pendingData, copyText: copyText).id(clip.id).padding(12)
+                ClipboardImagePreview(clip: clip, root: root, pendingData: pendingData, copyText: copyText, recognizedText: recognizedText).id(clip.id).padding(12)
               } else { ReadableText(text: clip.text ?? "") }
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 14))
