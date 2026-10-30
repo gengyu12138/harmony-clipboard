@@ -1,6 +1,7 @@
 #!/bin/zsh
 set -eu
 cd "${0:A:h}"
+./test.sh
 ./build.sh
 VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Info.plist)
 PACKAGE="HarmonyClipboard-${VERSION}-macOS-arm64"

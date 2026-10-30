@@ -16,6 +16,18 @@ struct Clip: Codable, Identifiable {
     var recordedDevices: [String] { devices ?? (["鸿蒙手机", "手机截图"].contains(source) ? ["手机"] : ["Mac"]) }
     var deviceLabel: String { recordedDevices.joined(separator: " · ") }
     var title: String { text.map { String($0.prefix(180)).replacingOccurrences(of: "\n", with: " ") } ?? "图片 · \(source)" }
+    var listPreview: String {
+        if let text {
+            if text.unicodeScalars.allSatisfy({ CharacterSet.whitespacesAndNewlines.contains($0) }) {
+                return "空白文字（\(text.count) 字符）"
+            }
+            return String(text.prefix(800))
+        }
+        if let imageText, imageText.unicodeScalars.contains(where: { !CharacterSet.whitespacesAndNewlines.contains($0) }) {
+            return String(imageText.prefix(800))
+        }
+        return "图片"
+    }
     func matches(_ query: String) -> Bool {
         query.isEmpty || (text ?? title).localizedCaseInsensitiveContains(query)
             || source.localizedCaseInsensitiveContains(query) || imageText?.localizedCaseInsensitiveContains(query) == true

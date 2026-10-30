@@ -6,7 +6,7 @@
 
 [下载 Release](https://github.com/gengyu12138/harmony-clipboard/releases) · [反馈问题](https://github.com/gengyu12138/harmony-clipboard/issues) · [MIT 许可证](LICENSE)
 
-> 当前源码和本地安装包版本为 **1.4.0**，提供图片文字搜索、多条合并复制、常用片段备份及文字整理，延续 1.3.1 的直接编辑、选字和手势缩放。GitHub 已发布的安装包仍为 **[v1.3.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.3.0)**；1.4.0 可从源码构建或使用本地打包产物。各版本变更与验证范围见 [CHANGELOG](CHANGELOG.md)。
+> 当前源码和本地安装包版本为 **1.4.1**，优化内容列表、保护片段备份并补充原生测试，包含 1.4.0 的图片文字搜索、合并复制及片段备份。GitHub 已发布的安装包仍为 **[v1.3.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.3.0)**；1.4.1 可从源码构建或使用本地打包产物。各版本变更与验证范围见 [CHANGELOG](CHANGELOG.md)。
 
 ## 能做什么
 
@@ -48,6 +48,7 @@
 - 历史右键菜单的“编辑后粘贴”和片段中的“临时编辑”仍可打开独立编辑窗口，只修改本次复制结果。选择仅复制或粘贴到呼出面板前的应用，后者需要辅助功能权限；关闭临时窗口丢弃尚未复制的草稿。
 - 复制出的文字仍按原规则自动同步到手机（最多 16 KB），手机返回的文字可能形成新的历史记录。原片段保持不变。
 - 片段库顶部“备份”可导出 JSON，或选择已有备份合并导入。备份仅包含常用片段和分组，不包含历史、图片、手机配置或调试授权；文件为明文，请妥善保管。
+- 导出时不能选择正在使用的 `snippets.json` 或指向它的链接别名，以免备份格式覆盖活动片段库；可覆盖普通备份文件。
 - 导入按同名分组合并；同一分组、标题和内容相同的片段跳过。遇到编号冲突时保留双方内容并重新编号；未知备份版本、无效数据、缺失分组或超限会整体拒绝，不覆盖现有片段。备份格式版本为 1，文件上限为 2 MB 加 4 KB 格式空间。
 
 ### 整理与合并文字
@@ -77,6 +78,8 @@ macOS 没有在通用剪贴板中提供可靠的来源应用证明；这里依�
 ## 界面与设置
 
 主面板、设置页和展开预览采用统一的**烟灰毛玻璃与薄荷绿强调色**。搜索与手机操作独立成行；左侧选择历史，右侧预览，底部“粘贴”返回原应用。设备筛选位于类型筛选栏右侧。支持系统“减少透明度”偏好，不使用持续背景动画。
+
+左侧列表只展示内容、缩略图及必要操作：文字保留换行、最多四行，图片识别后可显示文字摘要；时间、设备、来源和容量放在右侧详情，展开预览也可查看。列表截断不影响原文或复制结果。
 
 点击顶部“设置”按钮（滑杆图标）或连接状态进入设置：
 
@@ -111,7 +114,7 @@ shasum -a 256 -c HarmonyClipboard-1.3.0-macOS-arm64.zip.sha256
 
 应返回 `OK`。然后解压，进入解压目录。
 
-如使用本地打出的 1.4.0 安装包，对应校验文件为 `HarmonyClipboard-1.4.0-macOS-arm64.zip.sha256`；其余安装和升级步骤相同。1.4.0 尚未上传至 Release。
+如使用本地打出的 1.4.1 安装包，对应校验文件为 `HarmonyClipboard-1.4.1-macOS-arm64.zip.sha256`；其余安装和升级步骤相同。1.4.1 尚未上传至 Release。
 
 ### 2. 安装到当前用户
 
@@ -271,13 +274,18 @@ cd harmony-clipboard
 
 已有兼容的 hdc 安装时，可直接运行 `./install.command` 升级。普通升级会保留手机地址、历史、隐私状态及已有登录启动偏好。
 
-打包：
+原生测试与打包：
 
 ```sh
+./test.sh
 ./package.sh
 ```
 
-输出到被 Git 忽略的 `release/`，包含应用、安装程序、文档和 MIT 许可证，并生成 SHA-256 文件。不会打包 `~/Library` 中的数据、官方 hdc 或密钥。`build/` 是生成目录，请勿手工修改。
+`test.sh` 需要完整 Xcode 中的 XCTest，优先查找 `DEVELOPER_DIR` 或 `xcode-select` 对应位置，再查找 `/Applications/Xcode.app`；不自动安装工具。普通 `build.sh` 仍可使用 Command Line Tools，安装后的应用不依赖 Xcode 或 XCTest。
+
+`package.sh` 先运行同一套原生测试，通过且没有跳过才继续构建。输出到被 Git 忽略的 `release/`，包含应用、安装程序、文档和 MIT 许可证，并生成 SHA-256 文件。不会打包测试程序、`~/Library` 中的数据、官方 hdc 或密钥。`build/` 是生成目录，请勿手工修改。
+
+当前 64 项原生测试覆盖文字规则、备份编解码和真实片段文件读写、历史兼容与 OCR 缓存、列表摘要、原生图片视图几何及真实中英文 OCR。测试使用临时文件与内存图片，不读写个人历史或连接手机。这些检查不能替代完整窗口、系统文件选择器和目标应用焦点下的直接粘贴验收。
 
 源码结构：
 
@@ -291,8 +299,10 @@ Sources/SettingsView.swift  完整设置页
 Sources/Preferences.swift   快捷键及历史偏好
 Sources/ExpandedPreview.swift 完整文字与图片缩放
 Sources/ImagePreview.swift  主面板与展开窗口共用的原图加载、识别和复制
+Sources/ImageRecognition.swift 应用与测试共用的本机 OCR 后端
 Sources/LiveTextImage.swift 原图实况文本选择与复制
 Sources/TextTools.swift     常用片段库、分组与临时编辑
+Sources/SnippetStore.swift  片段持久化、实际备份读写及文件选择入口
 Sources/TextOperations.swift 文字整理与合并规则
 Sources/MergeView.swift     选择顺序与合并结果编辑
 Sources/SnippetBackup.swift 片段备份格式、校验与无覆盖合并
@@ -303,6 +313,7 @@ Bridge/sync.py              文字双向同步、重连、服务控制
 Bridge/capture.py           手机截图取回
 installer.py                当前用户安装与 LaunchAgent 配置
 build.sh / package.sh       构建与发行打包
+test.sh / Tests/            原生 XCTest 入口与回归用例
 ```
 
 ## 验证范围
@@ -310,6 +321,8 @@ build.sh / package.sh       构建与发行打包
 此前在实际 Mac / 手机环境验证过双向文字、无 USB 无线连接、手机锁屏期间从 Mac 写入后解锁粘贴、手机截图取回，以及面板直接粘贴、置顶和后台启动。Mac 休眠期间不会持续同步。
 
 各版本功能的本机验证与限制见 [CHANGELOG](CHANGELOG.md)。没有验证所有手机型号、旧 macOS、全新用户首次授权以及整机重启后的所有恢复场景。请不要将本工具作为重要数据唯一存储或要求强实时性的传输手段。
+
+1.4.1 的 64 项原生测试通过且没有跳过；实际窗口已确认列表与详情布局、临时编辑与还原、空草稿保护、片段搜索、图片 OCR 摘要和按钮缩放。系统菜单自动化超时及面板失焦收起影响了后续检查，合并窗口、备份文件选择器及直接粘贴未完成本轮界面回归；备份真实文件读写、合并规则和中英文 OCR 后端由原生测试验证。
 
 ## 许可证
 

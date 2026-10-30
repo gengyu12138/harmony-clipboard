@@ -176,26 +176,20 @@ struct PanelView: View {
 
     private func historyRow(_ clip: Clip, index: Int, selected: Bool) -> some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05))
-                if clip.isImage {
+            if clip.isImage {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05))
                     HistoryThumbnail(clip: clip, store: store).padding(3)
-                } else {
-                    Image(systemName: clip.isImage ? "photo" : "text.alignleft").foregroundStyle(RelayTheme.secondary)
-                }
-            }.frame(width: 32, height: 38).clipShape(RoundedRectangle(cornerRadius: 8))
-            VStack(alignment: .leading, spacing: 6) {
-                Text(clip.title).font(.system(size: 13, weight: .medium)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-                HStack(spacing: 5) {
-                    Text(clip.deviceLabel).lineLimit(1)
-                    Text("·")
-                    Text(clip.date, style: .relative).lineLimit(1)
-                    if clip.favorite { Image(systemName: "star.fill").foregroundStyle(RelayTheme.accent) }
-                    if clip.pinnedAt != nil { Image(systemName: "pin.fill").foregroundStyle(RelayTheme.accent).accessibilityLabel("已置顶") }
-                }.font(.system(size: 10)).foregroundStyle(RelayTheme.muted)
+                }.frame(width: 60, height: 64).clipShape(RoundedRectangle(cornerRadius: 8))
             }
+            Text(clip.listPreview).font(.system(size: 13)).lineSpacing(2).lineLimit(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
             VStack(spacing: 4) {
                 if index < 9 { Text("⌘\(index + 1)").font(.system(size: 9, design: .monospaced)).foregroundStyle(RelayTheme.muted) }
+                HStack(spacing: 3) {
+                    if clip.favorite { Image(systemName: "star.fill").foregroundStyle(RelayTheme.accent) }
+                    if clip.pinnedAt != nil { Image(systemName: "pin.fill").foregroundStyle(RelayTheme.accent).accessibilityLabel("已置顶") }
+                }.font(.system(size: 9))
                 if !clip.isImage {
                     Button { store.selected = clip.id; store.phone("send") } label: {
                         Image(systemName: "paperplane").font(.system(size: 12)).frame(width: 26, height: 26)
@@ -208,7 +202,7 @@ struct PanelView: View {
             .onTapGesture(count: 2) { store.selected = clip.id; store.copySelected(close: true) }
             // Immediate selection must not wait for the double-click interval.
             .simultaneousGesture(TapGesture().onEnded { store.selected = clip.id })
-            .accessibilityElement(children: .contain).accessibilityLabel(clip.title).accessibilityAddTraits(.isButton)
+            .accessibilityElement(children: .contain).accessibilityLabel(clip.listPreview).accessibilityAddTraits(.isButton)
             .accessibilityAction { store.selected = clip.id }
             .contextMenu {
                 Button(clip.pinnedAt == nil ? "置顶" : "取消置顶") { store.togglePin(clip.id) }
@@ -271,10 +265,13 @@ struct PanelView: View {
                         .padding(.horizontal, 16).padding(.bottom, 8)
                     }.frame(maxHeight: .infinity)
                 }
-                HStack {
-                    Label(clip.deviceLabel + " · " + clip.source, systemImage: clip.isImage ? "photo" : "text.alignleft").lineLimit(1)
-                    Spacer()
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(clip.bytes), countStyle: .file))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Label(clip.deviceLabel + " · " + clip.source, systemImage: clip.isImage ? "photo" : "text.alignleft").lineLimit(1).help(clip.deviceLabel + " · " + clip.source)
+                        Spacer()
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(clip.bytes), countStyle: .file))
+                    }
+                    Text("记录时间：" + clip.date.formatted(date: .numeric, time: .standard))
                 }.font(.system(size: 10)).foregroundStyle(RelayTheme.muted).padding(.horizontal, 18).padding(.bottom, 12)
             } else {
                 VStack(spacing: 12) {

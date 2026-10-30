@@ -72,10 +72,7 @@ struct ClipboardImagePreview: View {
             guard ImageAnalyzer.isSupported else { recognition = "滚轮或双指捏合缩放；此 Mac 不支持实况文本"; return }
             recognizing = true; recognition = "图片已加载，正在本机识别文字…"
             do {
-                var configuration = ImageAnalyzer.Configuration([.text])
-                let supported = ImageAnalyzer.supportedTextRecognitionLanguages
-                configuration.locales = ["zh-Hans", "zh-Hant", "en-US"].filter { supported.contains($0) }
-                let result = try await ImageAnalyzer().analyze(loaded, orientation: .up, configuration: configuration)
+                let result = try await ImageTextRecognition.analyze(loaded)
                 guard !Task.isCancelled else { return }
                 analysis = result; recognizing = false
                 recognizedText(result.transcript)

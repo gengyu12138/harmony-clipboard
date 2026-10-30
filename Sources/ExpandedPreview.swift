@@ -60,6 +60,7 @@ struct ExpandedPreview: View {
                 .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(RelayTheme.line, lineWidth: 0.5))
             HStack {
                 Text(clip.deviceLabel + " · " + clip.source).lineLimit(1)
+                Text(clip.date, format: .dateTime.year().month().day().hour().minute().second()).lineLimit(1)
                 Spacer()
                 Text(ByteCountFormatter.string(fromByteCount: Int64(clip.bytes), countStyle: .file))
                 Keycap(text: "Esc")
