@@ -39,6 +39,11 @@ final class ClipboardStore: ObservableObject {
     @Published var connectionDetail = ""
     @Published var settingsPresented = false
     @Published var imageRevision = 0
+    @Published var applicationExcluded = false
+    let exclusions = ExclusionStore()
+    lazy var snippets = SnippetStore(root: root)
+    private var exclusionObserver: NSObjectProtocol?
+    private var exclusionStamp = ""
     var changeHotkey: ((PanelPreferences) -> Bool)?
     private var privacyGeneration = UUID()
     private var skipPhoneBaseline = false
@@ -90,17 +95,20 @@ final class ClipboardStore: ObservableObject {
         lastCount = NSPasteboard.general.changeCount
         skipPhoneBaseline = true
         updatePrivacy()
+        updateExclusion()
+        exclusionObserver = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in self?.updateExclusion() }
         refreshConnection()
         timer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
             guard let self else { return }
             self.updatePrivacy()
-            if !self.paused && !self.privacyPaused { self.captureClipboard() }
+            self.updateExclusion()
+            if !self.paused && !self.privacyPaused && !self.applicationExcluded { self.captureClipboard() }
             else { self.lastCount = NSPasteboard.general.changeCount }
             if self.tick % 75 == 0 { self.trimHistory() }
             self.tick += 1
             if self.tick % 5 == 0 {
                 self.refreshConnection()
-                if self.online && !self.paused && !self.privacyPaused && !self.busy && !self.phoneReading {
+                if self.online && !self.paused && !self.privacyPaused && !self.applicationExcluded && !self.busy && !self.phoneReading {
                     self.phone("get", automatic: true)
                 }
             }
@@ -225,13 +233,14 @@ final class ClipboardStore: ObservableObject {
 
     func captureClipboard(source: String? = nil, force: Bool = false) {
         guard !privacyPaused else { return }
+        if !force && (applicationExcluded || exclusions.blocksForeground) { return }
         let pb = NSPasteboard.general
         guard force || pb.changeCount != lastCount else { return }
         lastCount = pb.changeCount
         let types = pb.types ?? []
         if types.contains(where: { ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"].contains($0.rawValue) }) { return }
         let origin = source ?? NSWorkspace.shared.frontmostApplication?.localizedName ?? "Mac"
-        let token = privacyGeneration, date = Date()
+        let token = privacyGeneration, exclusionToken = exclusions.value.generation, date = Date()
         for kind in [NSPasteboard.PasteboardType.png, NSPasteboard.PasteboardType("public.jpeg"), .tiff] {
             if types.contains(kind), let data = pb.data(forType: kind) {
                 guard data.count <= 20 * 1024 * 1024 else { message = "图片超过 20 MB，未加入历史"; return }
@@ -245,7 +254,8 @@ final class ClipboardStore: ObservableObject {
                     let id = SHA256.hash(data: converted).map { String(format: "%02x", $0) }.joined()
                     let result = converted, resultMime = mime
                     DispatchQueue.main.async {
-                        guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token else { return }
+                        guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token,
+                              force || (!self.exclusions.blocksForeground && self.exclusions.value.generation == exclusionToken) else { return }
                         self.imageCache.setObject(thumbnail, forKey: id as NSString)
                         self.insert(image: result, mime: resultMime, source: origin, capturedAt: date, preparedID: id)
                         if source == "手机截图" {
@@ -263,7 +273,8 @@ final class ClipboardStore: ObservableObject {
             processing.async { [weak self] in
                 let id = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
                 DispatchQueue.main.async {
-                    guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token else { return }
+                    guard let self, !self.privacyPaused, (!self.paused || force), self.privacyGeneration == token,
+                          force || (!self.exclusions.blocksForeground && self.exclusions.value.generation == exclusionToken) else { return }
                     self.insert(text: text, source: origin, capturedAt: date, preparedID: id)
                 }
             }
@@ -297,6 +308,32 @@ final class ClipboardStore: ObservableObject {
     }
 
     func imageData(for clip: Clip) -> Data? { clip.file.flatMap { pendingImages[$0] } }
+
+    @discardableResult
+    func copyText(_ text: String, paste: Bool = false) -> Bool {
+        let board = NSPasteboard.general
+        board.clearContents()
+        guard board.setString(text, forType: .string) else { message = "复制失败，请重试"; return false }
+        lastCount = board.changeCount
+        message = "已复制文字，原记录保持不变"
+        if paste {
+            let expected = board.changeCount
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard board.changeCount == expected else { self?.message = "剪贴板已变化，已取消粘贴"; return }
+                self?.paste?()
+            }
+        }
+        return true
+    }
+
+    func updateExclusion() {
+        let blocked = exclusions.blocksForeground, stamp = exclusions.value.generation
+        if blocked != applicationExcluded || stamp != exclusionStamp {
+            applicationExcluded = blocked; exclusionStamp = stamp; historyPauseChanged()
+            if blocked { message = "前台应用已排除，自动记录与同步暂停" }
+            else { message = "已恢复自动记录，已跳过排除期间的内容" }
+        }
+    }
 
     func copySelected(close: Bool = false, plainText: Bool = false) {
         guard let clip = current else { return }
@@ -403,12 +440,14 @@ final class ClipboardStore: ObservableObject {
             online = false; connection = "服务状态已过期"; connectionDetail = "后台服务可能退出，尝试立即重连"; return
         }
         online = value["connected"] as? Bool == true
+        if state == "application_excluded" { connection = "应用排除中"; connectionDetail = "前台应用的自动历史与双向同步已暂停"; return }
         connection = online ? (state == "phone_read_unavailable" ? "手机已连接 · 读取需解锁" : "手机已连接") : "手机连接失败 · 重试中"
         connectionDetail = online ? (state == "phone_read_unavailable" ? "请解锁手机后再取文字" : "文字同步可用") : "检查手机无线调试、授权和 IP／端口；也可立即重连"
     }
 
     func phone(_ action: String, automatic: Bool = false, inputText: String? = nil) {
         guard !busy else { return }
+        if automatic && exclusions.blocksForeground { return }
         if privacyPaused && ["get", "send", "capture", "reconnect"].contains(action) { message = "请先恢复隐私暂停"; return }
         let requestGeneration = privacyGeneration
         let text = action == "send" ? current?.text : inputText
@@ -446,7 +485,7 @@ final class ClipboardStore: ObservableObject {
                     if ["get", "capture"].contains(action) && (self.privacyPaused || self.privacyGeneration != requestGeneration) { return }
                     if let value = reply?["text"] as? String {
                         if automatic && self.skipPhoneBaseline { self.skipPhoneBaseline = false; self.lastPhoneText = value; return }
-                        if automatic && (self.paused || self.privacyPaused || self.lastPhoneText == value) { return }
+                        if automatic && (self.paused || self.privacyPaused || self.exclusions.blocksForeground || self.lastPhoneText == value) { return }
                         self.lastPhoneText = value
                         self.insert(text: value, source: "鸿蒙手机")
                         if !automatic {

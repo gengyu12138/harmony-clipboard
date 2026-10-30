@@ -6,7 +6,7 @@
 
 [下载 Release](https://github.com/gengyu12138/harmony-clipboard/releases) · [反馈问题](https://github.com/gengyu12138/harmony-clipboard/issues) · [MIT 许可证](LICENSE)
 
-> 当前版本为 **[v1.2.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.2.0)**，包含新版毛玻璃界面与完整设置。下载 Release 中的 macOS arm64 ZIP 安装包和同名 SHA-256 文件，按下文安装或升级。旧版说明见 [v1.1.0 README](https://github.com/gengyu12138/harmony-clipboard/blob/v1.1.0/README.md)。
+> 当前版本为 **[v1.3.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.3.0)**，包含应用图标、常用片段分组、应用排除、图片实况文本和临时编辑。下载 Release 中的 macOS arm64 ZIP 与同名 SHA-256 文件安装。旧版说明见 [v1.2.0 README](https://github.com/gengyu12138/harmony-clipboard/blob/v1.2.0/README.md)。
 
 ## 能做什么
 
@@ -22,6 +22,10 @@
 | 隐私暂停 | 15 分钟、1 小时或手动恢复；同时暂停历史与同步 |
 | 纯文本粘贴 | Shift+回车；文字历史本来就不保留富文本格式 |
 | 展开预览 | 完整文字阅读、图片缩放和平移 |
+| 常用片段分组 | 新建、重命名、搜索、编辑、移动分组；独立保存，不随历史清理 |
+| 按应用排除 | 设置 → 隐私；指定 Mac 应用在前台时暂停自动记录与双向同步 |
+| 图片 OCR / 实况文本 | 图片 → 识别文字；本机识别，在原图选字复制、查看全文或复制全部 |
+| 粘贴前临时编辑 | 文字预览 → 编辑后粘贴；不覆盖原历史或常用片段 |
 | 断线重连、登录自启 | 支持；启动后只在后台运行，不自动弹窗 |
 | 自动发现变化后的 IP / 端口 | 不支持；地址不变时自动重连，变化后需在设置更新 |
 | Mac 图片 → 手机剪贴板 | 不支持 |
@@ -29,7 +33,29 @@
 | 读取手机或 Mac 安装前的完整剪贴板历史 | 不支持 |
 | Mac 截图、长截图、改图 | 不包含 |
 
-常用片段分组、按应用排除规则、图片 OCR 和粘贴前编辑目前尚未实现。
+以上四项新增能力从 1.3.0 开始提供。
+
+### 常用片段与临时编辑
+
+- 点击筛选栏“常用片段”进入片段库。可从历史预览的“存为常用片段”按钮导入，也可手动新建。
+- 左侧管理分组，中间搜索当前分组，右侧编辑标题、内容及所属分组。修改后需保存或放弃，才能切换；删除分组会把内容移到“未分组”，删除片段需确认且无法撤销。
+- 片段写入独立的 `snippets.json`，不受历史条数、容量、过期规则影响。单条最多 64 KB，片段库最多 2 MB；保存失败时保留原文件并显示错误。
+- “编辑后粘贴”与片段中的“临时编辑”只修改本次复制结果，不改原记录。可选择仅复制或粘贴到呼出面板前的应用；后者仍需要辅助功能权限。临时窗口关闭即丢弃未复制的草稿。
+- 复制出的文字仍按原规则自动同步到手机（最多 16 KB），手机返回的文字可能形成新的历史记录。原片段保持不变。
+
+### 图片上直接复制文字
+
+选择图片，点“识别文字”（或展开预览）。识别后可在图片文字上拖动选中，用 ⌘C 或“复制选中文字”；“查看全文”和“复制全部文字”提供替代入口。缩放和平移仍可使用，分析使用原始图片而非列表缩略图。
+
+实现采用 Apple [ImageAnalyzer](https://developer.apple.com/documentation/visionkit/imageanalyzer) 和 [ImageAnalysisOverlayView](https://developer.apple.com/documentation/visionkit/imageanalysisoverlayview)，使用系统实况文本能力，在本机处理，不上传图片、不引入第三方 OCR 包或额外模型下载。只启用文字交互，不提供识图搜索或图片编辑。系统不支持、识别失败、无文字时会显示对应提示。
+
+此选择侧重原生选字体验和轻量部署，**不代表识别率优于所有 OCR 引擎**。当前截图样本的中文日期、时间可识别；图标可能被当成字符，小字、模糊、复杂排版、表格、手写及竖排需人工核对。未进行与 PaddleOCR 等引擎的同数据集准确率比较，也不保证保留表格布局。
+
+### 应用排除的范围
+
+设置 → 隐私 → 添加应用，选择 `.app` 后即时生效。指定应用在前台时，面板和独立同步服务暂停自动采集与双向传输；切走时清除待发送内容并重建基线，不补录、不补发。退出面板后，已保存的排除规则仍由同步服务执行。此规则只影响自动操作，手动“取手机文字”“发送到手机”和已有历史的复制仍可使用。
+
+macOS 没有在通用剪贴板中提供可靠的来源应用证明；这里依据前台应用识别，后台服务约每 0.8 秒检查，网络调用期间另做检查。**快速切换应用、后台复制、手机来源应用无法保证排除**，已经发出的传输可能完成。敏感操作请提前使用“隐私暂停”；设置无法读取时默认阻止自动同步。
 
 ## 界面与设置
 
@@ -42,7 +68,7 @@
 | 手机连接 | 状态、最后成功同步、IP / 端口、立即重连、启动 / 停止同步 | 操作后立即执行 |
 | 通用 | 面板与手机同步的独立登录启动开关、自定义呼出快捷键 | 自启开关即时保存、下次登录生效；快捷键需点击“保存修改” |
 | 历史记录 | 条数、容量、保留天数、清理非置顶记录 | 规则需保存；涉及删除时先确认；单独清理也需确认 |
-| 隐私 | 暂停 15 分钟、1 小时、手动恢复前暂停，以及恢复入口 | 同时控制记录与同步，暂停状态跨应用重启保留 |
+| 隐私 | 按应用排除、暂停 15 分钟、1 小时、手动恢复前暂停及恢复入口 | 即时保存；规则与暂停状态跨重启保留 |
 
 快捷键和历史规则有待保存修改时，底部显示提示与“保存修改”按钮；关闭设置不会保存这些草稿。其他即时操作不需要再次点击保存。置顶保护不会因清理规则改变而取消。
 
@@ -60,10 +86,10 @@
 
 ### 1. 下载并核对安装包
 
-从 [v1.2.0 Release](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.2.0) 下载 `HarmonyClipboard-1.2.0-macOS-arm64.zip` 和同名 `.sha256` 文件。在两者所在目录运行：
+从 [v1.3.0 Release](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.3.0) 下载 `HarmonyClipboard-1.3.0-macOS-arm64.zip` 和同名 `.sha256` 文件。在两者所在目录运行：
 
 ```sh
-shasum -a 256 -c HarmonyClipboard-1.2.0-macOS-arm64.zip.sha256
+shasum -a 256 -c HarmonyClipboard-1.3.0-macOS-arm64.zip.sha256
 ```
 
 应返回 `OK`。然后解压，进入解压目录。
@@ -90,6 +116,8 @@ shasum -a 256 -c HarmonyClipboard-1.2.0-macOS-arm64.zip.sha256
 ```
 
 已有安装可用同一命令升级。升级会短暂退出应用并停止同步，保留历史、收藏、置顶、手机地址和已有调试授权文件；此前停止的手机同步不会因升级自动恢复，两个登录自启开关也会保留。进程内尚未发送的同步文字不会跨重启保留。
+
+1.3.0 将生成的双剪贴板图标正式接入应用包，提供 16–1024 像素规格，供 Finder 和系统应用列表显示。菜单栏沿用适合小尺寸的单色剪贴板符号。更新后如 Finder 暂时显示旧图标，可关闭并重新打开该 Finder 窗口；不需要删除系统图标缓存。
 
 **安装包使用本地 ad-hoc 签名，没有 Apple Developer ID 签名或公证。** macOS 可能拦截首次运行。请核对来源、校验和及源码，按系统提供的正常授权流程处理；不要关闭 Gatekeeper 或全局安全保护。不愿运行未公证包时可从源码自行编译。升级改变签名后，辅助功能授权可能需要重新添加应用。
 
@@ -163,8 +191,8 @@ shasum -a 256 -c HarmonyClipboard-1.2.0-macOS-arm64.zip.sha256
 | 位置 | 用途 |
 | --- | --- |
 | `~/Applications/接力剪贴板.app` | 面板和随包同步源码 |
-| `~/Library/Application Support/HarmonyClipboardPanel/` | `history.json` 与历史图片 |
-| `~/Library/Application Support/HarmonyClipboard/` | 同步脚本、`bin/hdc`、`config.json`、`privacy.json`、状态和有限滚动日志 |
+| `~/Library/Application Support/HarmonyClipboardPanel/` | `history.json`、`snippets.json` 与历史图片 |
+| `~/Library/Application Support/HarmonyClipboard/` | 同步脚本、`bin/hdc`、`config.json`、`privacy.json`、`exclusions.json`、状态和有限滚动日志 |
 | `~/Library/LaunchAgents/local.gengyu.harmony-panel.plist` | 登录后台启动面板；主动退出后不会强行拉起 |
 | `~/Library/LaunchAgents/local.gengyu.harmony-clipboard.plist` | 文字同步后台服务；运行时异常退出后重试 |
 
@@ -206,6 +234,8 @@ shasum -a 256 -c HarmonyClipboard-1.2.0-macOS-arm64.zip.sha256
 
 ## 从源码构建与打包
 
+应用图标原图随源码保存在 `Resources/AppIcon.png`，克隆后即可构建，不需要另行下载资源。
+
 ```sh
 git clone https://github.com/gengyu12138/harmony-clipboard.git
 cd harmony-clipboard
@@ -213,7 +243,7 @@ cd harmony-clipboard
 ./install.command --hdc "/你的官方工具目录/hdc"
 ```
 
-`build.sh` 使用系统 `swiftc` 和原生 AppKit / SwiftUI / Carbon / CryptoKit / ApplicationServices / ImageIO，不依赖第三方 Swift 包或 pip 包。`installer.py` 生成当前用户的路径，不写死作者主目录。
+`build.sh` 使用系统 `swiftc` 和原生 AppKit / SwiftUI / Carbon / CryptoKit / ApplicationServices / ImageIO / VisionKit，不依赖第三方 Swift 包或 pip 包。使用 macOS 自带 `sips`、`iconutil` 将图标原图转为多尺寸 ICNS，再写入应用资源并签名；转换失败会停止构建。脚本不自动下载图标或模型。`installer.py` 生成当前用户的路径，不写死作者主目录。
 
 已有兼容的 hdc 安装时，可直接运行 `./install.command` 升级。普通升级会保留手机地址、历史、隐私状态及已有登录启动偏好。
 
@@ -235,6 +265,10 @@ Sources/PhoneSettings.swift 手机地址编辑
 Sources/SettingsView.swift  完整设置页
 Sources/Preferences.swift   快捷键及历史偏好
 Sources/ExpandedPreview.swift 完整文字与图片缩放
+Sources/LiveTextImage.swift 原图实况文本选择与复制
+Sources/TextTools.swift     常用片段库、分组与临时编辑
+Sources/AppExclusions.swift 应用排除配置与设置入口
+Resources/AppIcon.png       应用图标原图，构建时生成多尺寸 ICNS
 phone.py                    面板到同步服务的命令入口
 Bridge/sync.py              文字双向同步、重连、服务控制
 Bridge/capture.py           手机截图取回
@@ -246,7 +280,7 @@ build.sh / package.sh       构建与发行打包
 
 此前在实际 Mac / 手机环境验证过双向文字、无 USB 无线连接、手机锁屏期间从 Mac 写入后解锁粘贴、手机截图取回，以及面板直接粘贴、置顶和后台启动。Mac 休眠期间不会持续同步。
 
-1.2.0 新功能的本机验证与限制见更新记录；具体发行验证结果见 [CHANGELOG](CHANGELOG.md)。没有验证所有手机型号、旧 macOS、全新用户首次授权以及整机重启后的所有恢复场景。请不要将本工具作为重要数据唯一存储或要求强实时性的传输手段。
+各版本功能的本机验证与限制见 [CHANGELOG](CHANGELOG.md)。没有验证所有手机型号、旧 macOS、全新用户首次授权以及整机重启后的所有恢复场景。请不要将本工具作为重要数据唯一存储或要求强实时性的传输手段。
 
 ## 许可证
 

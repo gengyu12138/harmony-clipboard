@@ -229,6 +229,7 @@ struct SettingsView: View {
 
     private var privacy: some View {
         VStack(alignment: .leading, spacing: 22) {
+            ApplicationExclusionSettings(exclusions: store.exclusions)
             SettingSection(title: "隐私暂停") {
                 HStack(spacing: 12) {
                     Image(systemName: store.privacyPaused ? "hand.raised.fill" : "lock.shield")

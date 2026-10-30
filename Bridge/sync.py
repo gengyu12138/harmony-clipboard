@@ -58,6 +58,24 @@ class Pasteboard:
     def count(self):
         return self.call(C.c_long, self.board, 'changeCount')
 
+    def frontmost_bundle(self):
+        pool = self.call(C.c_void_p, self.cls(b'NSAutoreleasePool'), 'new')
+        try:
+            workspace = self.call(C.c_void_p, self.cls(b'NSWorkspace'), 'sharedWorkspace')
+            # NSWorkspace caches its frontmost app until the main run loop advances.
+            # This CLI otherwise waits in threading.Event/subprocess, so polling alone
+            # would keep returning the app that was frontmost when the bridge started.
+            loop = self.call(C.c_void_p, self.cls(b'NSRunLoop'), 'mainRunLoop')
+            deadline = self.call(C.c_void_p, self.cls(b'NSDate'), 'dateWithTimeIntervalSinceNow:',
+                                 (0.001,), (C.c_double,))
+            self.call(None, loop, 'runUntilDate:', (deadline,), (C.c_void_p,))
+            app = self.call(C.c_void_p, workspace, 'frontmostApplication')
+            bundle = self.call(C.c_void_p, app, 'bundleIdentifier') if app else None
+            value = self.call(C.c_char_p, bundle, 'UTF8String') if bundle else None
+            return value.decode('utf-8') if value else None
+        finally:
+            self.call(None, pool, 'drain')
+
     def read(self):
         pool = self.call(C.c_void_p, self.cls(b'NSAutoreleasePool'), 'new')
         try:
@@ -125,6 +143,24 @@ def privacy_status():
         return True, 'invalid'
 
 
+def exclusion_status(board):
+    path = ROOT / 'exclusions.json'
+    try:
+        if not path.exists():
+            return False, None
+        value = json.loads(path.read_text())
+        if (not isinstance(value, dict) or not isinstance(value.get('generation'), str)
+                or not isinstance(value.get('applications'), list)
+                or any(not isinstance(app, dict) or not isinstance(app.get('id'), str)
+                       or not app['id'] or not isinstance(app.get('name'), str)
+                       for app in value['applications'])):
+            return True, 'invalid'
+        identifiers = {app['id'] for app in value['applications']}
+        return board.frontmost_bundle() in identifiers, value['generation']
+    except (OSError, ValueError, TypeError, KeyError):
+        return True, 'invalid'
+
+
 class Bridge:
     def __init__(self):
         self.config = json.loads((ROOT / 'config.json').read_text())
@@ -149,6 +185,7 @@ class Bridge:
         self.saved_state = None
         self.saved_at = 0.0
         self.was_paused, self.privacy_stamp = privacy_status()
+        self.was_excluded, self.exclusion_stamp = exclusion_status(self.board)
 
     def status(self, **changes):
         self.state.update(changes)
@@ -209,7 +246,15 @@ class Bridge:
 
     def sync_allowed(self):
         active, stamp = privacy_status()
-        return not active and stamp == self.privacy_stamp
+        excluded, exclusion_stamp = exclusion_status(self.board)
+        allowed = not active and stamp == self.privacy_stamp and not excluded and exclusion_stamp == self.exclusion_stamp
+        if not allowed:
+            # Drop queued data immediately, including when exclusion begins during hdc IO.
+            self.pending = None
+            self.phone_text = None
+            self.mac_count = self.board.count()
+            self.was_excluded = excluded
+        return allowed
 
     def sync(self):
         if not self.sync_allowed():
@@ -275,13 +320,15 @@ class Bridge:
                 started = time.monotonic()
                 try:
                     active, stamp = privacy_status()
-                    if active or self.was_paused or stamp != self.privacy_stamp:
+                    excluded, exclusion_stamp = exclusion_status(self.board)
+                    if active or self.was_paused or stamp != self.privacy_stamp or excluded or self.was_excluded or exclusion_stamp != self.exclusion_stamp:
                         self.pending = None
                         self.phone_text = None
                         self.mac_count = self.board.count()
                         self.was_paused, self.privacy_stamp = active, stamp
-                    if active:
-                        self.status(state='privacy_paused', error=None)
+                        self.was_excluded, self.exclusion_stamp = excluded, exclusion_stamp
+                    if active or excluded:
+                        self.status(state='privacy_paused' if active else 'application_excluded', error=None)
                         STOP.wait(0.8)
                         continue
                     config = json.loads((ROOT / 'config.json').read_text())

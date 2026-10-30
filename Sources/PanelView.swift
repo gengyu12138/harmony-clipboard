@@ -1,12 +1,19 @@
 import AppKit
 import SwiftUI
 
+private struct SnippetRequest: Identifiable {
+    let id = UUID()
+    let text: String?
+}
+
 struct PanelView: View {
     @ObservedObject var store: ClipboardStore
     @FocusState private var searchFocused: Bool
     @State private var deletionID: String?
     @State private var confirmsDeletion = false
     @State private var expandedClip: Clip?
+    @State private var editingClip: Clip?
+    @State private var snippetRequest: SnippetRequest?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,7 +32,13 @@ struct PanelView: View {
             SettingsView(store: store).presentationBackground(.clear)
         }
         .sheet(item: $expandedClip) { clip in
-            ExpandedPreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip)).presentationBackground(.clear)
+            ExpandedPreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) }).presentationBackground(.clear)
+        }
+        .sheet(item: $editingClip) { clip in
+            TemporaryEdit(original: clip.text ?? "", copy: { store.copyText($0, paste: $1) }).presentationBackground(.clear)
+        }
+        .sheet(item: $snippetRequest) { request in
+            SnippetsView(snippets: store.snippets, store: store, seed: request.text).presentationBackground(.clear)
         }
         .onReceive(NotificationCenter.default.publisher(for: .init("FocusClipboardSearch"))) { _ in searchFocused = true }
         .alert("删除这条历史记录？", isPresented: $confirmsDeletion) {
@@ -87,6 +100,8 @@ struct PanelView: View {
                     .accessibilityAddTraits(store.filter == category ? .isSelected : [])
             }
             Spacer()
+            Button { snippetRequest = SnippetRequest(text: nil) } label: { Label("常用片段", systemImage: "square.stack") }
+                .buttonStyle(RelayButtonStyle(quiet: true))
             Text("\(store.visible.count) 条").font(.system(size: 11)).foregroundStyle(RelayTheme.muted)
             Rectangle().fill(RelayTheme.line).frame(width: 1, height: 14).padding(.horizontal, 9)
             Menu {
@@ -189,6 +204,10 @@ struct PanelView: View {
             .contextMenu {
                 Button(clip.pinnedAt == nil ? "置顶" : "取消置顶") { store.togglePin(clip.id) }
                 Button("复制") { store.selected = clip.id; store.copySelected() }
+                if let text = clip.text {
+                    Button("存为常用片段") { snippetRequest = SnippetRequest(text: text) }
+                    Button("编辑后粘贴") { editingClip = clip }
+                }
                 Button("删除记录", role: .destructive) { deletionID = clip.id; confirmsDeletion = true }
             }
     }
@@ -198,6 +217,12 @@ struct PanelView: View {
             HStack(spacing: 6) {
                 Text(store.current?.isImage == true ? "图片预览" : "内容预览").font(.system(size: 12, weight: .medium)).foregroundStyle(RelayTheme.secondary)
                 Spacer()
+                if let text = store.current?.text {
+                    RelayIconButton(title: "存为常用片段", symbol: "text.badge.plus") { snippetRequest = SnippetRequest(text: text) }
+                }
+                if store.current?.isImage == true {
+                    Button("识别文字") { expandedClip = store.current }.buttonStyle(RelayButtonStyle()).help("在原图上选中文字并复制")
+                }
                 RelayIconButton(title: "置顶所选记录", symbol: store.current?.pinnedAt == nil ? "pin" : "pin.fill", selected: store.current?.pinnedAt != nil) {
                     if let id = store.current?.id { store.togglePin(id) }
                 }.disabled(store.current == nil)
@@ -235,6 +260,9 @@ struct PanelView: View {
                     .help("复制到 Mac 剪贴板").disabled(store.current == nil)
                 Button { store.copySelected(close: true, plainText: true) } label: { Text("纯文本粘贴") }.buttonStyle(RelayButtonStyle())
                     .help("Shift+回车").disabled(store.current == nil || store.current?.isImage == true)
+                if store.current?.text != nil {
+                    Button("编辑后粘贴") { editingClip = store.current }.buttonStyle(RelayButtonStyle())
+                }
                 Spacer()
                 Button { store.copySelected(close: true) } label: {
                     HStack(spacing: 12) { Text("粘贴"); Image(systemName: "return") }
