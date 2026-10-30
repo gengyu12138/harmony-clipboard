@@ -28,6 +28,7 @@ struct PanelView: View {
         }
         .modifier(GlassShell())
         .onChange(of: store.paused) { _, _ in store.historyPauseChanged() }
+        .onChange(of: store.current?.id) { _, _ in store.previewDraft = nil }
         .sheet(isPresented: $store.settingsPresented) {
             SettingsView(store: store).presentationBackground(.clear)
         }
@@ -169,8 +170,8 @@ struct PanelView: View {
         HStack(spacing: 10) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8).fill(.white.opacity(0.05))
-                if clip.isImage, let image = store.image(for: clip) {
-                    Image(nsImage: image).resizable().scaledToFit().padding(3)
+                if clip.isImage {
+                    HistoryThumbnail(clip: clip, store: store).padding(3)
                 } else {
                     Image(systemName: clip.isImage ? "photo" : "text.alignleft").foregroundStyle(RelayTheme.secondary)
                 }
@@ -217,29 +218,41 @@ struct PanelView: View {
             HStack(spacing: 6) {
                 Text(store.current?.isImage == true ? "图片预览" : "内容预览").font(.system(size: 12, weight: .medium)).foregroundStyle(RelayTheme.secondary)
                 Spacer()
-                if let text = store.current?.text {
-                    RelayIconButton(title: "存为常用片段", symbol: "text.badge.plus") { snippetRequest = SnippetRequest(text: text) }
-                }
-                if store.current?.isImage == true {
-                    Button("识别文字") { expandedClip = store.current }.buttonStyle(RelayButtonStyle()).help("在原图上选中文字并复制")
+                if let clip = store.current, clip.text != nil {
+                    RelayIconButton(title: "存为常用片段", symbol: "text.badge.plus") { snippetRequest = SnippetRequest(text: store.previewText(for: clip)) }
                 }
                 RelayIconButton(title: "置顶所选记录", symbol: store.current?.pinnedAt == nil ? "pin" : "pin.fill", selected: store.current?.pinnedAt != nil) {
                     if let id = store.current?.id { store.togglePin(id) }
                 }.disabled(store.current == nil)
                 RelayIconButton(title: "收藏所选内容", symbol: store.current?.favorite == true ? "star.fill" : "star", selected: store.current?.favorite == true) { store.favoriteSelected() }.disabled(store.current == nil)
-                RelayIconButton(title: "展开预览", symbol: "arrow.up.left.and.arrow.down.right") { expandedClip = store.current }.disabled(store.current == nil)
+                RelayIconButton(title: "展开预览", symbol: "arrow.up.left.and.arrow.down.right") {
+                    guard var clip = store.current else { return }
+                    if clip.text != nil {
+                        let text = store.previewText(for: clip)
+                        clip.text = text; clip.bytes = text.utf8.count
+                    }
+                    expandedClip = clip
+                }.disabled(store.current == nil)
                 RelayIconButton(title: "删除所选记录", symbol: "trash", destructive: true) { deletionID = store.current?.id; confirmsDeletion = true }.disabled(store.current == nil)
             }.padding(14)
             Rectangle().fill(RelayTheme.line).frame(height: 0.5).padding(.horizontal, 16)
             if let clip = store.current {
-                if clip.isImage, let image = store.image(for: clip) {
-                    Image(nsImage: image).resizable().scaledToFit().padding(18).frame(maxWidth: .infinity, maxHeight: .infinity)
+                if clip.isImage {
+                    ClipboardImagePreview(clip: clip, root: store.root, pendingData: store.imageData(for: clip), copyText: { store.copyText($0) })
+                        .id(clip.id).padding(12)
                 } else {
                     VStack(spacing: 4) {
-                        ReadableText(text: String((clip.text ?? "图片加载中或文件不可用").prefix(12000)))
-                        if let text = clip.text, text.count > 12000 {
-                            Button("展开查看全文") { expandedClip = clip }.buttonStyle(RelayButtonStyle()).padding(.bottom, 12)
+                        ReadableText(text: store.previewText(for: clip), onChange: {
+                            store.previewDraft = (clip.id, $0)
+                        }).id(clip.id).accessibilityLabel("预览文字，可直接编辑")
+                        HStack {
+                            Text("直接编辑 · 仅用于本次复制或粘贴").font(.system(size: 10)).foregroundStyle(RelayTheme.muted)
+                            Spacer()
+                            if store.previewDraft?.id == clip.id {
+                                Button("还原") { store.previewDraft = nil }.buttonStyle(RelayButtonStyle(quiet: true))
+                            }
                         }
+                        .padding(.horizontal, 16).padding(.bottom, 8)
                     }.frame(maxHeight: .infinity)
                 }
                 HStack {
@@ -260,9 +273,6 @@ struct PanelView: View {
                     .help("复制到 Mac 剪贴板").disabled(store.current == nil)
                 Button { store.copySelected(close: true, plainText: true) } label: { Text("纯文本粘贴") }.buttonStyle(RelayButtonStyle())
                     .help("Shift+回车").disabled(store.current == nil || store.current?.isImage == true)
-                if store.current?.text != nil {
-                    Button("编辑后粘贴") { editingClip = store.current }.buttonStyle(RelayButtonStyle())
-                }
                 Spacer()
                 Button { store.copySelected(close: true) } label: {
                     HStack(spacing: 12) { Text("粘贴"); Image(systemName: "return") }
@@ -282,5 +292,23 @@ struct PanelView: View {
             Keycap(text: "↑↓"); Text("选择").font(.system(size: 10)).foregroundStyle(RelayTheme.muted)
             Keycap(text: store.preferences.shortcutLabel)
         }.padding(.horizontal, 23).frame(height: 46)
+    }
+}
+
+private struct HistoryThumbnail: View {
+    let clip: Clip
+    let store: ClipboardStore
+    @State private var image: NSImage?
+    @State private var failed = false
+    var body: some View {
+        Group {
+            if let image { Image(nsImage: image).resizable().scaledToFit() }
+            else if failed { Image(systemName: "photo.badge.exclamationmark").foregroundStyle(RelayTheme.muted).help("图片文件不可用") }
+            else { ProgressView().controlSize(.mini) }
+        }.task(id: clip.id) {
+            let loaded = await store.loadThumbnail(for: clip)
+            guard !Task.isCancelled else { return }
+            image = loaded; failed = loaded == nil
+        }
     }
 }

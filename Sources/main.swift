@@ -38,7 +38,7 @@ final class ClipboardStore: ObservableObject {
     @Published var lastSync = "尚无同步记录"
     @Published var connectionDetail = ""
     @Published var settingsPresented = false
-    @Published var imageRevision = 0
+    @Published var previewDraft: (id: String, text: String)?
     @Published var applicationExcluded = false
     let exclusions = ExclusionStore()
     lazy var snippets = SnippetStore(root: root)
@@ -53,7 +53,6 @@ final class ClipboardStore: ObservableObject {
     private var saveVersion = 0
     private var pendingImages: [String: Data] = [:]
     private var pendingDeletes: Set<String> = []
-    private var loadingImages: Set<String> = []
     @Published var busy = false
     @Published var message = "复制后自动记录 · 仅保存在本机"
     @Published var online = false
@@ -291,23 +290,25 @@ final class ClipboardStore: ObservableObject {
         return NSImage(cgImage: image, size: .zero)
     }
 
-    func image(for clip: Clip) -> NSImage? {
+    @MainActor
+    func loadThumbnail(for clip: Clip) async -> NSImage? {
         if let cached = imageCache.object(forKey: clip.id as NSString) { return cached }
-        guard let file = clip.file, !loadingImages.contains(clip.id) else { return nil }
-        loadingImages.insert(clip.id)
+        guard let file = clip.file else { return nil }
         let pending = pendingImages[file], url = root.appendingPathComponent(file)
-        processing.async { [weak self] in
-            let image = (pending ?? (try? Data(contentsOf: url))).flatMap { Self.thumbnail($0) }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                // Keep failed loads marked until the record is replaced; do not spin on a missing file.
-                if let image { self.imageCache.setObject(image, forKey: clip.id as NSString); self.loadingImages.remove(clip.id); self.imageRevision += 1 }
-            }
-        }
-        return nil
+        let image = await Task.detached(priority: .userInitiated) {
+            (pending ?? (try? Data(contentsOf: url))).flatMap { Self.thumbnail($0) }
+        }.value
+        guard !Task.isCancelled else { return nil }
+        if let image { imageCache.setObject(image, forKey: clip.id as NSString) }
+        return image
     }
 
     func imageData(for clip: Clip) -> Data? { clip.file.flatMap { pendingImages[$0] } }
+
+    func previewText(for clip: Clip) -> String {
+        if let draft = previewDraft, draft.id == clip.id { return draft.text }
+        return clip.text ?? ""
+    }
 
     @discardableResult
     func copyText(_ text: String, paste: Bool = false) -> Bool {
@@ -338,6 +339,11 @@ final class ClipboardStore: ObservableObject {
     func copySelected(close: Bool = false, plainText: Bool = false) {
         guard let clip = current else { return }
         if plainText && clip.isImage { message = "图片不能作为纯文本粘贴"; return }
+        if let draft = previewDraft, draft.id == clip.id, clip.text != nil {
+            guard !draft.text.isEmpty else { message = "预览内容为空，请输入文字或还原"; return }
+            copyText(draft.text, paste: close)
+            return
+        }
         let pb = NSPasteboard.general
         if let file = clip.file, let mime = clip.mime {
             guard let data = pendingImages[file] ?? (try? Data(contentsOf: root.appendingPathComponent(file))) else { message = "图片文件不可用"; return }
@@ -581,6 +587,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if event.modifierFlags.contains(.command), let number = Int(event.charactersIgnoringModifiers ?? ""), (1...9).contains(number) {
                 self.store.selectNumber(number - 1); return nil
             }
+            // Editing in the preview keeps normal cursor movement and line breaks.
+            if let editor = self.panel.firstResponder as? NSTextView, editor.isEditable && !editor.isFieldEditor { return event }
             if event.keyCode == 125 { self.store.move(1); return nil }
             if event.keyCode == 126 { self.store.move(-1); return nil }
             if event.keyCode == 36 {
