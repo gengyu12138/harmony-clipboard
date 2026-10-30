@@ -6,7 +6,7 @@
 
 [下载 Release](https://github.com/gengyu12138/harmony-clipboard/releases) · [反馈问题](https://github.com/gengyu12138/harmony-clipboard/issues) · [MIT 许可证](LICENSE)
 
-> 本文对应 `main` 分支的 **1.2.0 源码预览版**，包含新版毛玻璃界面与完整设置。已发布安装包为 **[v1.1.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.1.0)**；1.2.0 尚未发布 Release，体验新版请[从源码构建](#从源码构建与打包)。1.1.0 的操作说明请查看[该版本 README](https://github.com/gengyu12138/harmony-clipboard/blob/v1.1.0/README.md)。
+> 当前版本为 **[v1.2.0](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.2.0)**，包含新版毛玻璃界面与完整设置。下载 Release 中的 macOS arm64 ZIP 安装包和同名 SHA-256 文件，按下文安装或升级。旧版说明见 [v1.1.0 README](https://github.com/gengyu12138/harmony-clipboard/blob/v1.1.0/README.md)。
 
 ## 能做什么
 
@@ -60,10 +60,10 @@
 
 ### 1. 下载并核对安装包
 
-已发布版本请从 [v1.1.0 Release](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.1.0) 下载 `HarmonyClipboard-1.1.0-macOS-arm64.zip` 和同名 `.sha256` 文件，并按该版本说明安装。在两者所在目录运行：
+从 [v1.2.0 Release](https://github.com/gengyu12138/harmony-clipboard/releases/tag/v1.2.0) 下载 `HarmonyClipboard-1.2.0-macOS-arm64.zip` 和同名 `.sha256` 文件。在两者所在目录运行：
 
 ```sh
-shasum -a 256 -c HarmonyClipboard-1.1.0-macOS-arm64.zip.sha256
+shasum -a 256 -c HarmonyClipboard-1.2.0-macOS-arm64.zip.sha256
 ```
 
 应返回 `OK`。然后解压，进入解压目录。
